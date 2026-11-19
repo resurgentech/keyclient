@@ -211,7 +211,15 @@ paths:
         previous poll was handled) gets `429 slow_down` with the old interval
         plus 2, which is the request's interval from then on in every later
         reply; the interval never goes down. A too-soon poll counts as a
-        poll for timing.
+        poll for timing. The interval never exceeds ten times the interval
+        the `201` gave.
+
+        Once a request is approved, the provider delivers the key on the
+        next poll that carries the right poll secret and arrives before the
+        request expires, whether or not that poll is early. Pacing applies
+        only while the request is undecided. When a request is approved, its
+        expiry is moved to no earlier than the time of approval plus twice
+        the current interval.
 
         `200`, `403` and `410` are final. The approved reply carries the key
         and is sent once; if it is lost, the next poll gets `410 consumed`

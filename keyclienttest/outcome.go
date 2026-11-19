@@ -140,7 +140,7 @@ func (o Outcome) After(d time.Duration) Outcome {
 
 // Scenario returns the poll outcomes of the named scenario of
 // testdata/keyrequest/scenarios.json ("approved", "denied", "expired",
-// "unauthorized", "lost-reply"). Each step is mapped to the constructor of its
+// "unauthorized", "lost-reply", "approved-early-poll"). Each step is mapped to the constructor of its
 // fixture, and the step's "override" is applied to the body of the reply. It
 // panics on an unknown name.
 //
@@ -198,6 +198,7 @@ func Scenario(name string) []Outcome {
 type reqState struct {
 	secret   string
 	interval int
+	first    int  // the interval of the 201; the interval never exceeds ten times it (P-6)
 	approved bool // an approved reply has been served
 }
 
@@ -213,7 +214,7 @@ type rendered struct {
 // the lock that guards st.
 func render(o Outcome, st *reqState, def int, base http.Header) rendered {
 	if st == nil {
-		st = &reqState{interval: def}
+		st = &reqState{interval: def, first: def}
 	}
 	var body any
 	status := o.status
@@ -222,6 +223,9 @@ func render(o Outcome, st *reqState, def int, base http.Header) rendered {
 		body = map[string]any{"status": "pending", "interval": st.interval}
 	case kindSlowDown:
 		st.interval += 2
+		if st.first > 0 && st.interval > 10*st.first {
+			st.interval = 10 * st.first
+		}
 		body = map[string]any{"status": "slow_down", "interval": st.interval}
 	case kindApproved:
 		body = map[string]any{"status": "approved", "name": o.name, "role": o.role, "key": o.key}

@@ -291,7 +291,7 @@ func (p *Provider) createLocked() rendered {
 	c.ApproveURL = p.srv.URL + "/requests?code=" + c.UserCode
 	c.Interval = p.interval
 	c.ExpiresIn = p.expiresIn
-	p.requests[c.RequestID] = &reqState{secret: c.PollSecret, interval: p.interval}
+	p.requests[c.RequestID] = &reqState{secret: c.PollSecret, interval: p.interval, first: p.interval}
 	p.lastSec = c.PollSecret
 	b, err := json.Marshal(c)
 	if err != nil {

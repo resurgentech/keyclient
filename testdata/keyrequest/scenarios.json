@@ -41,6 +41,15 @@
       "steps": [
         { "wait_seconds": 3, "fixture": "poll-consumed", "outcome": "stop and report; file a new request on the next use" }
       ]
+    },
+    {
+      "name": "approved-early-poll",
+      "description": "the request was approved; the next authorised poll collects the key even though it is early. Pacing applies only while a request is undecided.",
+      "steps": [
+        { "wait_seconds": 3, "fixture": "poll-pending", "outcome": "poll again" },
+        { "wait_seconds": 1, "fixture": "poll-approved", "outcome": "store the key and stop" },
+        { "wait_seconds": 3, "fixture": "poll-consumed", "outcome": "stop and report; a tool that stored the key does not poll again" }
+      ]
     }
   ]
 }

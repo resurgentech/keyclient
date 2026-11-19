@@ -28,6 +28,13 @@
 //     right secret), and that [Provider.PollSecret] never appears in anything
 //     the tool printed or wrote.
 //
+// The fake follows the provider's rules of docs/CONTRACT.md and docs/STATES.md
+// where it decides anything itself: [SlowDown] raises the interval by 2 but
+// never above ten times the interval of the 201 (P-6); a scripted [Approved]
+// is served on any authorised poll, early or not, because the fake never
+// paces (P-11); and it never expires a request on its own, so an approval is
+// never lost to expiry (P-7) unless the script says [Expired].
+//
 // # List
 //
 // [NewList] is a fake key-list endpoint. A test of a service (a user of package

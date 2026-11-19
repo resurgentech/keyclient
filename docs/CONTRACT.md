@@ -4,7 +4,9 @@ Two contracts between a **key provider**, the **services** that check keys, and 
 file is the canonical text. The OpenAPI document is [`spec/key-request.yaml`](../spec/key-request.yaml) and the
 canonical fixtures are in [`testdata/`](../testdata/README.md). The Go packages in this module are the reference
 consumers: `keylist` for a service, `request` for a tool. A change is made here first, then in the spec, the
-fixtures and the code.
+fixtures and the code. What must be true between the messages (every state of the provider, the tool and the
+service, and each transition) is written out in [`STATES.md`](STATES.md), which the reference consumers follow row
+by row.
 
 ## Key list
 
@@ -79,6 +81,9 @@ When it applies a good `200` (and when it loads the cache), each entry is accept
 - **Repeats.** If a `name` or a `sha256` appears twice in one list, the first is kept and the rest are skipped and
   logged.
 - The log line gives the name and the reason. **It never gives a hash**, a pull token or a presented key.
+- The consumer's decision for a given entry must stay the same for the life of the consumer: a change to the
+  service's own tokens or to the roles it knows takes effect when the consumer restarts, which applies the cache
+  and the next pull afresh.
 
 The accepted entries replace the live list in one atomic swap: a request sees the whole old list or the whole new
 one. A key absent from the new list is refused from the swap on.
@@ -129,7 +134,8 @@ so delay a new key's first use, by about one window and at worst until the next 
 ### Transport
 
 The list holds no key, but whoever can alter the response can add an entry and so grant access. Use `https`, or a
-network path you trust, for `personal_keys.url`.
+network path you trust, for `personal_keys.url`. The reference consumer refuses a plain `http` list URL unless its
+host is a loopback address or its operator has explicitly allowed plain `http`.
 
 ## Key request
 
@@ -274,8 +280,13 @@ the latest response that carried one.
 **`slow_down` arithmetic.** The provider counts a poll as too soon when fewer than `interval` seconds have passed
 since the previous poll was handled. It answers `429` with the old interval plus 2, and the new value is the
 request's interval from then on, in every later reply. A too-soon poll counts as a poll for timing. The interval
-never goes down. The tool uses the new value for its next wait. A `429` with a body the tool cannot read is treated
-as `slow_down` with the interval plus 2.
+never goes down. The interval never exceeds ten times the interval the `201` gave. The tool uses the new value for
+its next wait. A `429` with a body the tool cannot read is treated as `slow_down` with the interval plus 2.
+
+**Approval and pacing.** Once a request is approved, the provider delivers the key on the next poll that carries
+the right poll secret and arrives before the request expires, whether or not that poll is early. Pacing applies only
+while the request is undecided. When a request is approved, its expiry is moved to no earlier than the time of
+approval plus twice the current interval.
 
 **The approved reply.** `key` is an opaque string of 16 to 512 printable ASCII characters with no whitespace.
 `name` is the name the key has in the provider's list. `role` is the role granted, which may differ from the role
@@ -301,8 +312,10 @@ A filed request stays valid until it expires, even if the tool exits. A tool may
 request instead of filing a new one. It resumes only a request filed for the same service and request URL as the
 current run; otherwise it drops the stored request and files anew. A tool must not file a second request while it
 holds an unexpired one, because the provider limits how many requests one source may have open, and two copies of
-one tool must not poll the same request at once. It removes the stored request when the request settles (a final
-status, or the key stored) or expires.
+one tool must not poll the same request at once. It keeps the current interval and the time the next poll is due
+with the stored request, updates them after each poll, and on its next run polls when that poll is due, so the
+pace holds across runs and a tool that runs only briefly each time still collects its key. It removes the stored
+request when the request settles (a final status, or the key stored) or expires.
 
 ### Defaults unchanged
 

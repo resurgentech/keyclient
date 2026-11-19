@@ -303,6 +303,44 @@ func TestSlowDownRaisesInterval(t *testing.T) {
 	}
 }
 
+// P-6: the interval never exceeds ten times the interval the 201 gave.
+func TestP6_SlowDownCappedAtTenTimesFirstInterval(t *testing.T) {
+	p := NewProvider(t)
+	p.SetInterval(2)
+	c := file(t, p)
+	var outs []Outcome
+	for i := 0; i < 15; i++ {
+		outs = append(outs, SlowDown())
+	}
+	p.Script(outs...)
+	var last float64
+	for i := 0; i < 15; i++ {
+		r := poll(t, c, c.PollSecret)
+		last = jsonField(t, r.body, "interval").(float64)
+		if last > 20 {
+			t.Fatalf("poll %d: interval %v, over ten times the first (2)", i, last)
+		}
+	}
+	if last != 20 {
+		t.Fatalf("interval settled at %v, want 20", last)
+	}
+}
+
+// P-11: an approved reply is served on any authorised poll, early or not (the
+// fake never paces), and a scenario with an early collecting poll says so.
+func TestP11_ApprovedDeliveredOnEarlyPoll(t *testing.T) {
+	p := NewProvider(t)
+	c := file(t, p)
+	p.Script(Scenario("approved-early-poll")...)
+	var statuses []int
+	for i := 0; i < 3; i++ {
+		statuses = append(statuses, poll(t, c, c.PollSecret).status)
+	}
+	if statuses[0] != 202 || statuses[1] != 200 || statuses[2] != 410 {
+		t.Fatalf("statuses %v, want 202 200 410", statuses)
+	}
+}
+
 func TestFinalOutcomes(t *testing.T) {
 	p := NewProvider(t)
 	c := file(t, p)
