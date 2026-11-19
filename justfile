@@ -1,7 +1,7 @@
 # keyclient: the client side of the key-request and key-list contracts. Native justfile.
 
-# Build and test scratch stays inside the repo (tmp/ is gitignored).
-export GOTMPDIR := justfile_directory() / "tmp" / "go"
+# Build and test scratch stays inside the repo (tmp/ is gitignored; a leading _ keeps ./... out of it).
+export GOTMPDIR := justfile_directory() / "tmp" / "_go"
 
 # List available recipes
 default:
