@@ -1,0 +1,13 @@
+{
+  "summary": "Poll: slow down",
+  "description": "The tool polled before the interval had passed. The new interval is the old one (3) plus 2, and stays so in every later reply. The tool uses it for its next wait.",
+  "x-status": 429,
+  "x-headers": {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store"
+  },
+  "value": {
+    "status": "slow_down",
+    "interval": 5
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "summary": "Poll: approved",
+  "description": "Approved. Sent exactly once. The SHA-256 of the key, as lowercase hex, is the first entry of keylist/full.json (097628f2...2fd1).",
+  "x-status": 200,
+  "x-headers": {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store"
+  },
+  "value": {
+    "status": "approved",
+    "name": "alice@laptop",
+    "role": "agent",
+    "key": "example-key-0123456789abcdefghijklmnopqrstuvw"
+  }
+}

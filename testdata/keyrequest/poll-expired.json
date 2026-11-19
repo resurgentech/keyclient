@@ -1,0 +1,12 @@
+{
+  "summary": "Poll: expired",
+  "description": "The time ran out before the request was approved or collected. Final: the tool stops and reports.",
+  "x-status": 410,
+  "x-headers": {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store"
+  },
+  "value": {
+    "status": "expired"
+  }
+}

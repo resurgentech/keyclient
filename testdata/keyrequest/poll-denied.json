@@ -1,0 +1,12 @@
+{
+  "summary": "Poll: denied",
+  "description": "A person denied the request. Final: the tool stops and reports.",
+  "x-status": 403,
+  "x-headers": {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store"
+  },
+  "value": {
+    "status": "denied"
+  }
+}

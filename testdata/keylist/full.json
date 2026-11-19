@@ -1,0 +1,33 @@
+{
+  "summary": "A list of several keys",
+  "description": "The current list: four entries with different roles, sorted by name. The first entry is the SHA-256 of the key in keyrequest/poll-approved.json, so a request-then-pull round trip can be tested. The ETag is a quoted strong validator; a client treats it as opaque.",
+  "x-status": 200,
+  "x-headers": {
+    "Content-Type": "application/json",
+    "ETag": "\"725d544c16cbd3c19288ac55547e4f2b\""
+  },
+  "value": {
+    "keys": [
+      {
+        "name": "alice@laptop",
+        "role": "agent",
+        "sha256": "097628f28c9143508f639c6a239bd2d6f4cc362062345c6cf7f8c1132cb12fd1"
+      },
+      {
+        "name": "bob@workstation",
+        "role": "full",
+        "sha256": "c87aefa412da65def61d2a0727581de803abf080c33345df16f9131755e4cbc4"
+      },
+      {
+        "name": "carol@desktop",
+        "role": "agent",
+        "sha256": "dcb7ad4f18ffc88b6fddbca61140407afe460ab4a527a21e4eacdee183ba5252"
+      },
+      {
+        "name": "ci.runner@build-1",
+        "role": "submitter",
+        "sha256": "65f5190730f363ec3e1484962586d1f7e5d36a6b4f5988551844cfc99167b7dd"
+      }
+    ]
+  }
+}

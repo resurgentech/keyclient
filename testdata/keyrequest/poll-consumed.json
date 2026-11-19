@@ -1,0 +1,12 @@
+{
+  "summary": "Poll: consumed",
+  "description": "The key was already handed out; this is the answer to a poll after the approved reply. If that reply was lost the key cannot be sent again, and the tool files a new request. Final.",
+  "x-status": 410,
+  "x-headers": {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store"
+  },
+  "value": {
+    "status": "consumed"
+  }
+}

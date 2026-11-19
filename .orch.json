@@ -1,0 +1,4 @@
+{
+  "project": "keyclient",
+  "gate": "set -e; just test; just vet; just lint"
+}

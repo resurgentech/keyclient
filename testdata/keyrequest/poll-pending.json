@@ -1,0 +1,13 @@
+{
+  "summary": "Poll: pending",
+  "description": "No decision yet. Poll again after interval seconds.",
+  "x-status": 202,
+  "x-headers": {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store"
+  },
+  "value": {
+    "status": "pending",
+    "interval": 3
+  }
+}

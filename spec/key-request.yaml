@@ -1,0 +1,570 @@
+openapi: 3.0.3
+info:
+  title: Key request and key list
+  description: |
+    The HTTP side of the two contracts in `docs/CONTRACT.md`, which is the
+    canonical text; where this document and the contract disagree, the
+    contract wins. Fixtures: `testdata/`.
+
+    Three parties:
+    - A **service** checks keys on its API. It serves one endpoint of this
+      document, the discovery fragment `GET /v1/key-request`.
+    - A **provider** takes key requests from tools, lets a person approve
+      them, and serves each service the list of the SHA-256 hashes of its
+      keys. It serves the other three operations.
+    - A **tool** needs a key. It calls discovery, files a request, and polls.
+
+    **Paths are illustrative.** A tool never builds a provider path: it is
+    handed `request_url` by discovery (or by its own flag or environment
+    variable) and `poll_url` and `approve_url` by the `201` reply, all of
+    them absolute URLs. A service is configured with its list URL. The
+    provider paths below are the ones the fixtures use (origin
+    `https://provider.example`); a provider may use others.
+
+    **The discovery fragment.** A service copies the path item
+    `/v1/key-request` and the schema component `KeyRequestDiscovery` into its
+    own OpenAPI 3.0.3 document, and adds a `tags` entry if its lint requires
+    one.
+
+    Conventions:
+    - Request and response bodies are `application/json`.
+    - Every 4xx and 5xx response that has a body carries the `Error` body,
+      except the poll outcomes `429 slow_down`, `403` and `410`, which carry
+      the `status` bodies below.
+    - Every response to filing and to polling carries
+      `Cache-Control: no-store`.
+    - A provider may require more of a client on filing and polling (for
+      example a header added by a reverse proxy in front of it). A client of
+      this contract sends nothing more than this document shows; anything
+      else a provider needs is added on the way, not by the tool.
+
+    Fixtures with no body (`testdata/keylist/not-modified.json`, the `304`
+    of the list; `testdata/keyrequest/discovery-none.json`, the `404` of
+    discovery) cannot be referenced as examples; they are named in prose.
+  version: 0.1.0
+  license:
+    name: MIT
+servers:
+  - url: https://provider.example
+    description: the placeholder origin of the fixtures; use your deployment's URL
+tags:
+  - name: discovery
+    description: Served by the service. Where a tool asks for a key.
+  - name: requests
+    description: Served by the provider. Filing and polling a key request.
+  - name: lists
+    description: Served by the provider. The key list a service pulls.
+paths:
+  /v1/key-request:
+    get:
+      tags: [discovery]
+      summary: Where to ask for a key
+      description: |
+        Served by the service, not the provider. No authentication. Answers
+        `200` with the absolute URL where key requests are filed, or `404`
+        when the service has none configured. A client must not rely on the
+        body of a `404`.
+
+        A client that is given a request URL directly does not call this
+        endpoint. Discovery that fails any other way (a network error, a
+        status other than 200 and 404, a `request_url` that is not an
+        absolute `http` or `https` URL) is an error the client reports; it
+        files nothing.
+
+        Fixtures: `testdata/keyrequest/discovery.json` (the 200 example
+        below) and `testdata/keyrequest/discovery-none.json` (the 404, which
+        has no body and so no example).
+      operationId: getKeyRequestDiscovery
+      security: []
+      responses:
+        '200':
+          description: The service is configured with a request URL.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyRequestDiscovery'
+              examples:
+                discovery:
+                  $ref: '../testdata/keyrequest/discovery.json'
+        '404':
+          description: |
+            The service has no request URL. The response may carry a body in
+            the service's own error format; the client must not rely on it.
+  /v1/services/{service}/requests:
+    post:
+      tags: [requests]
+      summary: File a key request
+      description: |
+        The `request_url` from discovery. No authentication by the tool: a
+        person approves the request in a browser at `approve_url`, and the
+        tool polls `poll_url` until it is told the outcome.
+
+        The body is at most 2048 bytes. All four fields are required and an
+        unknown field is rejected. The client shows `message` from an error
+        and does not branch on `error`.
+      operationId: fileKeyRequest
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Service'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KeyRequest'
+            examples:
+              request:
+                $ref: '../testdata/keyrequest/request.json'
+      responses:
+        '201':
+          description: The request is filed and pending.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyRequestCreated'
+              examples:
+                created:
+                  $ref: '../testdata/keyrequest/created.json'
+        '400':
+          description: |
+            A field is missing, unknown or breaks its rule (`bad_request`), or
+            the role is not offered (`unknown_role`). Do not retry unchanged.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: The provider will not take requests from this client (`unauthorized`).
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: The provider has no such service (`not_found`).
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: The body is over 2048 bytes (`too_large`).
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Too many requests from this source (`rate_limited`).
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: The provider is at capacity (`capacity`). May retry later.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: An internal error (`internal`). May retry later.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /v1/requests/{id}/poll:
+    post:
+      tags: [requests]
+      summary: Poll a key request
+      description: |
+        The `poll_url` from the `201` reply, with
+        `Authorization: Bearer <poll_secret>`. No request body; a body is
+        ignored.
+
+        The first poll comes no sooner than `interval` seconds after the
+        `201` arrived. Each later poll comes no sooner than the current
+        interval after the previous poll's response arrived. A poll the
+        provider counts as too soon (fewer than `interval` seconds since the
+        previous poll was handled) gets `429 slow_down` with the old interval
+        plus 2, which is the request's interval from then on in every later
+        reply; the interval never goes down. A too-soon poll counts as a
+        poll for timing.
+
+        `200`, `403` and `410` are final. The approved reply carries the key
+        and is sent once; if it is lost, the next poll gets `410 consumed`
+        and the tool files a new request. A `401` (wrong poll secret or
+        unknown id; the two cannot be told apart) never changes the request.
+        A `5xx`, a network error or a timeout is transient: the tool keeps
+        polling at the current interval until the request expires.
+      operationId: pollKeyRequest
+      security:
+        - pollSecret: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The `request_id` from the `201` reply.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Approved. Sent exactly once.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollApproved'
+              examples:
+                approved:
+                  $ref: '../testdata/keyrequest/poll-approved.json'
+        '202':
+          description: No decision yet. Poll again after `interval` seconds.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollPending'
+              examples:
+                pending:
+                  $ref: '../testdata/keyrequest/poll-pending.json'
+        '401':
+          description: The poll secret is wrong or the id is unknown. The request does not change.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                unauthorized:
+                  $ref: '../testdata/keyrequest/poll-unauthorized.json'
+        '403':
+          description: A person denied the request. Final.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollDenied'
+              examples:
+                denied:
+                  $ref: '../testdata/keyrequest/poll-denied.json'
+        '410':
+          description: |
+            Final. `expired`: the time ran out. `consumed`: the key was
+            already handed out.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/PollExpired'
+                  - $ref: '#/components/schemas/PollConsumed'
+              examples:
+                expired:
+                  $ref: '../testdata/keyrequest/poll-expired.json'
+                consumed:
+                  $ref: '../testdata/keyrequest/poll-consumed.json'
+        '429':
+          description: |
+            The tool polled too soon. `interval` is the old interval plus 2,
+            and is the interval from now on. A body the tool cannot read is
+            treated as `slow_down` with the interval plus 2.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollSlowDown'
+              examples:
+                slow_down:
+                  $ref: '../testdata/keyrequest/poll-slow-down.json'
+  /v1/lists/{service}:
+    get:
+      tags: [lists]
+      summary: The key list of one service
+      description: |
+        The URL a service is configured with (`personal_keys.url`). With
+        `Authorization: Bearer <pull token>` when the service has one, and
+        `If-None-Match` when it holds a list it received in this process.
+
+        The entries are sorted by `name` in byte order and names are unique,
+        so one set of keys always gives one body and one `ETag`. The `ETag`
+        is a quoted strong validator that the consumer treats as opaque.
+        `304` has no body; its fixture is `testdata/keylist/not-modified.json`.
+        An empty list is a valid `200` and revokes every pulled key; a `404`
+        is not an empty list and revokes nothing.
+
+        The consumer bounds each pull with a timeout (10 seconds suggested)
+        and reads at most 4 MiB of body.
+      operationId: getKeyList
+      security:
+        - pullToken: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/Service'
+        - name: If-None-Match
+          in: header
+          required: false
+          description: The `ETag` of a list the caller already holds.
+          schema:
+            type: string
+          example: '"725d544c16cbd3c19288ac55547e4f2b"'
+      responses:
+        '200':
+          description: The current list.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyList'
+              examples:
+                full:
+                  $ref: '../testdata/keylist/full.json'
+                empty:
+                  $ref: '../testdata/keylist/empty.json'
+        '304':
+          description: Unchanged since `If-None-Match`. No body.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+        '401':
+          description: The pull token is missing or wrong (`unauthorized`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: The provider has no list for this URL (`not_found`). Revokes nothing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  securitySchemes:
+    pollSecret:
+      type: http
+      scheme: bearer
+      description: The `poll_secret` from the `201` reply. Held only by the requester.
+    pullToken:
+      type: http
+      scheme: bearer
+      description: The service's pull token, when the provider requires one.
+  parameters:
+    Service:
+      name: service
+      in: path
+      required: true
+      description: A service the provider knows. Illustrative; see the description of this document.
+      schema:
+        type: string
+      example: example
+  headers:
+    ETag:
+      description: A quoted, strong validator of the list. Opaque to the consumer.
+      schema:
+        type: string
+        pattern: '^"[^"]+"$'
+    CacheControl:
+      description: Always `no-store`.
+      schema:
+        type: string
+        enum: [no-store]
+    RetryAfter:
+      description: Whole seconds, at least 1, until the limit that tripped lifts.
+      schema:
+        type: integer
+        minimum: 1
+  schemas:
+    KeyRequestDiscovery:
+      type: object
+      required: [request_url]
+      properties:
+        request_url:
+          type: string
+          format: uri
+          description: Absolute `http` or `https` URL where a key request is filed with `POST`.
+          example: https://provider.example/v1/services/example/requests
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: |
+            A code. The reference codes are `bad_request`, `unknown_role`,
+            `unauthorized`, `not_found`, `too_large`, `rate_limited`,
+            `capacity` and `internal`. A client does not branch on it.
+        message:
+          type: string
+          description: Shown to the user.
+    KeyRequest:
+      type: object
+      additionalProperties: false
+      required: [name_hint, host, tool, role]
+      properties:
+        name_hint:
+          type: string
+          pattern: '^[A-Za-z0-9_.@-]{1,64}$'
+          description: A suggested name, shown to the approver for information.
+        host:
+          type: string
+          pattern: '^[A-Za-z0-9_.-]{1,64}$'
+          description: The machine the tool runs on.
+        tool:
+          type: string
+          pattern: '^[A-Za-z0-9_.@/+-]{1,64}$'
+          description: The tool and its version.
+        role:
+          type: string
+          pattern: '^[A-Za-z0-9_.-]{1,32}$'
+          description: The role the tool wants. The approver may grant another.
+    KeyRequestCreated:
+      type: object
+      required: [request_id, poll_url, poll_secret, approve_url, user_code, interval, expires_in]
+      properties:
+        request_id:
+          type: string
+          description: Opaque.
+        poll_url:
+          type: string
+          format: uri
+          description: Absolute URL.
+        poll_secret:
+          type: string
+          description: Opaque. A secret; only the requester holds it.
+        approve_url:
+          type: string
+          format: uri
+          description: Absolute URL where a person approves. It never carries `poll_secret`.
+        user_code:
+          type: string
+          description: For display, such as `BCDF-GHJK`.
+        interval:
+          type: integer
+          minimum: 1
+          description: Seconds between polls.
+        expires_in:
+          type: integer
+          minimum: 1
+          description: Seconds until the request expires.
+    PollPending:
+      type: object
+      required: [status, interval]
+      properties:
+        status:
+          type: string
+          enum: [pending]
+        interval:
+          type: integer
+          minimum: 1
+    PollSlowDown:
+      type: object
+      required: [status, interval]
+      properties:
+        status:
+          type: string
+          enum: [slow_down]
+        interval:
+          type: integer
+          minimum: 1
+          description: The old interval plus 2; the interval from now on.
+    PollApproved:
+      type: object
+      required: [status, name, role, key]
+      properties:
+        status:
+          type: string
+          enum: [approved]
+        name:
+          type: string
+          pattern: '^[A-Za-z0-9_.@-]{1,64}$'
+          description: The name the key has in the provider's list.
+        role:
+          type: string
+          pattern: '^[A-Za-z0-9_.-]{1,32}$'
+          description: The role granted, which may differ from the role asked.
+        key:
+          type: string
+          pattern: '^[!-~]{16,512}$'
+          description: Opaque. 16 to 512 printable ASCII characters, no whitespace. Sent exactly once.
+    PollDenied:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [denied]
+    PollExpired:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [expired]
+    PollConsumed:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [consumed]
+    KeyList:
+      type: object
+      required: [keys]
+      description: Unknown members of the object or of an entry are ignored by the consumer.
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/KeyEntry'
+    KeyEntry:
+      type: object
+      required: [name, role, sha256]
+      properties:
+        name:
+          type: string
+          pattern: '^[A-Za-z0-9_.@-]{1,64}$'
+          description: The key's owner and machine, for example `alice@laptop`.
+        role:
+          type: string
+          pattern: '^[A-Za-z0-9_.-]{1,32}$'
+          description: The consumer decides which roles it knows.
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Lowercase hexadecimal SHA-256 of the key's bytes.

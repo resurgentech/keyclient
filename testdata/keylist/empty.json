@@ -1,0 +1,12 @@
+{
+  "summary": "An empty list",
+  "description": "A valid 200 with no keys. It revokes every pulled key at the next apply. It is not the same as a 404, which revokes nothing.",
+  "x-status": 200,
+  "x-headers": {
+    "Content-Type": "application/json",
+    "ETag": "\"9638d11914735d0072002dd4d67c734a\""
+  },
+  "value": {
+    "keys": []
+  }
+}

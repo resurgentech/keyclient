@@ -1,0 +1,8 @@
+{
+  "summary": "Not modified",
+  "description": "The answer to a request whose If-None-Match holds the ETag of keylist/full.json. No body, so there is no value member. The ETag header is repeated.",
+  "x-status": 304,
+  "x-headers": {
+    "ETag": "\"725d544c16cbd3c19288ac55547e4f2b\""
+  }
+}

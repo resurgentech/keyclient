@@ -1,0 +1,46 @@
+{
+  "description": "Named poll sequences. Plain JSON, not an Example Object. Each scenario starts with keyrequest/created.json (interval 3). Each step is one poll: fixture names a file in this directory (without .json); override, when present, replaces members of that fixture's value for this step; wait_seconds is how long the tool waits, from the arrival of the previous reply, before the poll (a slow_down reply raises the interval to 5, so later waits are 5). outcome says what the tool does after the step. Every poll outcome appears in at least one scenario.",
+  "scenarios": [
+    {
+      "name": "approved",
+      "description": "pending, then a too-early poll, then pending at the new interval, then approved once, then consumed.",
+      "steps": [
+        { "wait_seconds": 3, "fixture": "poll-pending", "outcome": "poll again" },
+        { "wait_seconds": 1, "fixture": "poll-slow-down", "outcome": "use interval 5" },
+        { "wait_seconds": 5, "fixture": "poll-pending", "override": { "interval": 5 }, "outcome": "poll again" },
+        { "wait_seconds": 5, "fixture": "poll-approved", "outcome": "store the key and stop" },
+        { "wait_seconds": 5, "fixture": "poll-consumed", "outcome": "stop and report; a tool that stored the key does not poll again" }
+      ]
+    },
+    {
+      "name": "denied",
+      "description": "pending, then a person denies it.",
+      "steps": [
+        { "wait_seconds": 3, "fixture": "poll-pending", "outcome": "poll again" },
+        { "wait_seconds": 3, "fixture": "poll-denied", "outcome": "stop and report" }
+      ]
+    },
+    {
+      "name": "expired",
+      "description": "pending until the time runs out.",
+      "steps": [
+        { "wait_seconds": 3, "fixture": "poll-pending", "outcome": "poll again" },
+        { "wait_seconds": 3, "fixture": "poll-expired", "outcome": "stop and report" }
+      ]
+    },
+    {
+      "name": "unauthorized",
+      "description": "a wrong poll secret or an unknown id: reported, and the request is kept.",
+      "steps": [
+        { "wait_seconds": 3, "fixture": "poll-unauthorized", "outcome": "report; keep the request" }
+      ]
+    },
+    {
+      "name": "lost-reply",
+      "description": "the approved reply never reached the tool, so the next poll gets consumed and the tool must file a new request.",
+      "steps": [
+        { "wait_seconds": 3, "fixture": "poll-consumed", "outcome": "stop and report; file a new request on the next use" }
+      ]
+    }
+  ]
+}

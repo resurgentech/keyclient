@@ -1,0 +1,18 @@
+{
+  "summary": "A request filed",
+  "description": "The 201 reply to keyrequest/request.json, with every reply field. The first poll comes no sooner than interval seconds later. The request stops being valid expires_in seconds after this reply arrived.",
+  "x-status": 201,
+  "x-headers": {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store"
+  },
+  "value": {
+    "request_id": "fakeRequestId00000000x",
+    "poll_url": "https://provider.example/v1/requests/fakeRequestId00000000x/poll",
+    "poll_secret": "fake-poll-secret-0123456789-ABCDEFGHIJKLMNO",
+    "approve_url": "https://provider.example/requests?code=BCDF-GHJK",
+    "user_code": "BCDF-GHJK",
+    "interval": 3,
+    "expires_in": 600
+  }
+}

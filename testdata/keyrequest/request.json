@@ -1,0 +1,13 @@
+{
+  "summary": "A request to file",
+  "description": "The body a tool sends with POST to the request URL. A request body has no x-status.",
+  "x-headers": {
+    "Content-Type": "application/json"
+  },
+  "value": {
+    "name_hint": "alice@laptop",
+    "host": "laptop",
+    "tool": "mytool/0.3.0",
+    "role": "agent"
+  }
+}

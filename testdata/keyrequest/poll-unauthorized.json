@@ -1,0 +1,13 @@
+{
+  "summary": "Poll: unauthorized",
+  "description": "The poll secret is wrong, or the request id is unknown; the two cannot be told apart. A 401 never changes the request, so the tool keeps it and may retry.",
+  "x-status": 401,
+  "x-headers": {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store"
+  },
+  "value": {
+    "error": "unauthorized",
+    "message": "unauthorized"
+  }
+}
