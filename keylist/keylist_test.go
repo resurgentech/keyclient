@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -37,6 +38,8 @@ func (s *syncBuf) String() string {
 	defer s.mu.Unlock()
 	return s.b.String()
 }
+
+func acceptAll(keylist.Entry) (bool, string) { return true, "" }
 
 func hashOf(key string) string {
 	sum := sha256.Sum256([]byte(key))
@@ -84,6 +87,7 @@ func (e *env) opts() keylist.Options {
 		URL:       e.l.URL(),
 		CacheFile: e.cache(),
 		Refresh:   time.Hour,
+		Accept:    acceptAll,
 		Logger:    slog.New(slog.NewTextHandler(e.log, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 }
@@ -623,8 +627,8 @@ func TestFailedCacheWriteStillApplies(t *testing.T) {
 	o := e.opts()
 	o.CacheFile = filepath.Join(blocker, "list.json") // a directory cannot be made under a file
 	s := e.source(o)
-	if err := s.Pull(context.Background()); err != nil {
-		t.Fatal(err)
+	if err := s.Pull(context.Background()); !errors.Is(err, keylist.ErrCacheWrite) {
+		t.Fatalf("Pull = %v, want ErrCacheWrite", err)
 	}
 	mustFind(t, s, "key-alice", "alice@laptop", "agent")
 	if out := e.log.String(); !strings.Contains(out, "cache not written") {
@@ -766,7 +770,7 @@ func TestErrorTextHasNoUserinfo(t *testing.T) {
 	if err == nil || strings.Contains(err.Error(), "userinfo-secret") {
 		t.Fatalf("err = %v", err)
 	}
-	if _, nerr := keylist.New(keylist.Options{URL: "ftp://svc:userinfo-secret@host/x", CacheFile: "c"}); nerr == nil || strings.Contains(nerr.Error(), "userinfo-secret") {
+	if _, nerr := keylist.New(keylist.Options{URL: "ftp://svc:userinfo-secret@host/x", CacheFile: "c", Accept: acceptAll}); nerr == nil || strings.Contains(nerr.Error(), "userinfo-secret") {
 		t.Fatalf("New err = %v", nerr)
 	}
 	if strings.Contains(e.log.String(), "userinfo-secret") {
@@ -838,7 +842,7 @@ func TestNewFailsOnBadTokenFile(t *testing.T) {
 
 // TestNewValidates is requirement 13.
 func TestNewValidates(t *testing.T) {
-	ok := keylist.Options{URL: "https://provider.example/v1/lists/x", CacheFile: "cache.json"}
+	ok := keylist.Options{URL: "https://provider.example/v1/lists/x", CacheFile: "cache.json", Accept: acceptAll}
 	if _, err := keylist.New(ok); err != nil {
 		t.Fatal(err)
 	}
@@ -851,6 +855,7 @@ func TestNewValidates(t *testing.T) {
 		"missing CacheFile": func(o *keylist.Options) { o.CacheFile = "" },
 		"negative Refresh":  func(o *keylist.Options) { o.Refresh = -time.Second },
 		"negative OnMiss":   func(o *keylist.Options) { o.RefreshOnMiss = -time.Second },
+		"missing Accept":    func(o *keylist.Options) { o.Accept = nil },
 	}
 	for name, mod := range cases {
 		o := ok

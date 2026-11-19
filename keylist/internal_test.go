@@ -25,6 +25,7 @@ func newInternal(t *testing.T, l *keyclienttest.List, mod func(*Options)) *Sourc
 		URL:       l.URL(),
 		CacheFile: filepath.Join(t.TempDir(), "list.json"),
 		Refresh:   time.Hour,
+		Accept:    func(Entry) (bool, string) { return true, "" },
 		Logger:    quiet(),
 	}
 	if mod != nil {

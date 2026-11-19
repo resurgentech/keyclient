@@ -54,15 +54,10 @@ func Example() {
 		CacheFile:     filepath.Join(dir, "cache", "personal-keys.json"),
 		Refresh:       keylist.DefaultRefresh,
 		RefreshOnMiss: keylist.DefaultRefreshOnMiss,
-		Accept: func(e keylist.Entry) (bool, string) {
-			switch {
-			case e.Role != "agent" && e.Role != "full":
-				return false, "unknown role"
-			case ownNames[e.Name] || ownHashes[e.SHA256]:
-				return false, "clashes with the tokens file"
-			}
-			return true, ""
-		},
+		// Unknown roles and clashes with the daemon's own tokens are refused.
+		Accept: keylist.AcceptRoles([]string{"agent", "full"}, func(e keylist.Entry) bool {
+			return ownNames[e.Name] || ownHashes[e.SHA256]
+		}),
 	})
 	if err != nil {
 		fmt.Println(err)
