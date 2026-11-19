@@ -44,7 +44,7 @@ func TestLockWaitHonoursContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := request.Ensure(ctx, e.opts)
+	_, err := ensure(t, ctx, e.opts)
 	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 2*time.Second {
 		t.Errorf("err = %v after %v", err, time.Since(start))
 	}
@@ -63,7 +63,7 @@ func TestLockWaiterReadsTheToken(t *testing.T) {
 	}
 	done := make(chan out, 1)
 	go func() {
-		res, err := request.Ensure(context.Background(), e.opts)
+		res, err := ensure(t, context.Background(), e.opts)
 		done <- out{res, err}
 	}()
 	time.Sleep(100 * time.Millisecond)
@@ -95,7 +95,7 @@ func TestLockFileNotFollowed(t *testing.T) {
 	if err := os.Symlink(target, e.token+".lock"); err != nil {
 		t.Fatal(err)
 	}
-	_, err := request.Ensure(context.Background(), e.opts)
+	_, err := ensure(t, context.Background(), e.opts)
 	if err == nil || len(e.p.Filed()) != 0 {
 		t.Errorf("err = %v, filed = %d", err, len(e.p.Filed()))
 	}
@@ -114,7 +114,7 @@ func TestPendingFIFORefused(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := request.Ensure(context.Background(), e.opts)
+		_, err := ensure(t, context.Background(), e.opts)
 		done <- err
 	}()
 	select {
@@ -141,9 +141,15 @@ func TestTwoProcessesChild(t *testing.T) {
 	o := request.Options{
 		Override: os.Getenv(childEnv + "_URL"), TokenPath: os.Getenv(childEnv + "_TOKEN"),
 		Role: "agent", NameHint: "alice@laptop", Host: "laptop", Tool: "mytool/0.3.0", Wait: true,
-		Notify: func(request.Notice) { fmt.Println("CHILD notice") },
+		Notify: func(n request.Notice) {
+			if n.Resumed {
+				fmt.Println("CHILD notice resumed") // T-21: the other child's request, shown while waiting
+			} else {
+				fmt.Println("CHILD notice")
+			}
+		},
 	}
-	res, err := request.Ensure(context.Background(), o)
+	res, err := ensure(t, context.Background(), o)
 	if err == nil && res.Token == os.Getenv(childEnv+"_KEY") {
 		fmt.Println("CHILD has the token")
 	} else {
@@ -152,7 +158,9 @@ func TestTwoProcessesChild(t *testing.T) {
 }
 
 // Two processes started together with no token and no pending file file one
-// request, and both end with the token (reviewer R8).
+// request, and both end with the token (reviewer R8). Only one notice is of a
+// filed request; the other process may show that request as resumed while it
+// waits for the lock (T-21).
 func TestTwoProcesses(t *testing.T) {
 	p := keyclienttest.NewProvider(t)
 	p.SetInterval(2)

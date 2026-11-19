@@ -20,31 +20,62 @@ type session struct {
 	pendPath  string
 	unit      time.Duration
 
+	pf        pendingFile // what the pending file holds for this request
 	requestID string
 	pollURL   string
 	secret    string
-	interval  int       // seconds, in units of s.unit
-	nextAt    time.Time // when the next poll may be sent
+	interval  int       // the current interval I, in units of s.unit
+	nextAt    time.Time // next: when the next poll may be sent
 	expiresAt time.Time
 }
 
 func (s *session) wait() time.Duration { return time.Duration(s.interval) * s.unit }
 
-// drop removes the pending file once the request has settled, but only while
-// it still holds this request's id: a pending file of another request is left
-// alone.
-func (s *session) drop() {
+// due reports whether the next poll (or the final one at the expiry) may be
+// sent now.
+func (s *session) due() bool {
+	at := s.nextAt
+	if s.expiresAt.Before(at) {
+		at = s.expiresAt
+	}
+	return !at.After(now())
+}
+
+// ours reports whether the pending file still holds this request. Only the
+// lock holder calls it, and only it changes the file (T-I2).
+func (s *session) ours() bool {
 	b, exists, err := readPending(s.pendPath)
 	if err != nil || !exists {
-		return
+		return false
 	}
 	var pf struct {
 		RequestID string `json:"request_id"`
 	}
-	if json.Unmarshal(b, &pf) != nil || pf.RequestID != s.requestID {
+	return json.Unmarshal(b, &pf) == nil && pf.RequestID == s.requestID
+}
+
+// drop removes the pending file once the request has settled, but only while
+// it still holds this request's id: a pending file of another request is left
+// alone.
+func (s *session) drop() {
+	if s.ours() {
+		os.Remove(s.pendPath)
+	}
+}
+
+// save rewrites the pending file with the current interval and the time the
+// next poll is due (L-22), so that a later run keeps the pace. A failure to
+// write it is not an error of the loop: the pace holds in this run, and a later
+// run polls no sooner than the interval the file holds after the next poll that
+// is due by it.
+func (s *session) save() {
+	if !s.ours() {
 		return
 	}
-	os.Remove(s.pendPath)
+	s.pf.Interval, s.pf.NextPollAt = s.interval, s.nextAt
+	if b, err := json.Marshal(s.pf); err == nil {
+		atomicfile.Write(s.pendPath, b)
+	}
 }
 
 // pollReply is the body of a poll reply.
@@ -62,73 +93,84 @@ type pollReply struct {
 // and only then, if that reply is not final, returns ErrExpired.
 func (s *session) run(ctx context.Context) (Result, error) {
 	for {
-		at, last := s.nextAt, false
-		if !at.Before(s.expiresAt) {
-			at, last = s.expiresAt, true
+		if res, err, done := s.step(ctx); done {
+			return res, err
 		}
-		if err := sleepUntil(ctx, at); err != nil {
-			return Result{}, err
-		}
-		status, body, over, err := s.post(ctx)
-		arrived := now()
-		if err != nil && ctx.Err() != nil {
-			return Result{}, ctx.Err()
-		}
-		if err == nil { // a failure to get a reply is transient
-			var b pollReply
-			readable := !over && json.Unmarshal(body, &b) == nil
-
-			switch {
-			case status == http.StatusAccepted:
-				if readable && b.Interval >= 1 {
-					s.interval = min(b.Interval, maxSeconds)
-				}
-			case status == http.StatusTooManyRequests:
-				if readable && b.Interval > s.interval {
-					s.interval = min(b.Interval, maxSeconds)
-				} else {
-					s.interval = min(s.interval+2, maxSeconds)
-				}
-			case status == http.StatusOK:
-				if over {
-					return Result{}, errors.New("key request: the 200 reply is larger than 64 KiB; nothing was stored and the request is kept")
-				}
-				return s.approved(readable, b)
-			case status == http.StatusForbidden:
-				s.drop()
-				return Result{}, ErrDenied
-			case status == http.StatusGone:
-				if readable && b.Status == "consumed" {
-					s.drop()
-					if tok, err := readToken(s.tokenPath); err == nil && tok != "" {
-						return Result{Token: tok}, nil
-					}
-					return Result{}, ErrConsumed
-				}
-				// expired, or a 410 whose body we cannot read: final either way.
-				s.drop()
-				return Result{}, ErrExpired
-			case status == http.StatusUnauthorized:
-				msg := ""
-				if readable {
-					msg = shown(b.Message, s.secret, maxMessage)
-				}
-				if msg == "" {
-					return Result{}, ErrUnauthorized
-				}
-				return Result{}, fmt.Errorf("%w: %s", ErrUnauthorized, msg)
-			case status >= 500:
-				// transient
-			default:
-				return Result{}, fmt.Errorf("key request: poll answered unexpected status %d; the request is kept", status)
-			}
-		}
-		if last {
-			s.drop()
-			return Result{}, ErrExpired
-		}
-		s.nextAt = arrived.Add(s.wait())
 	}
+}
+
+// step waits for the next poll (or the final one at the expiry), sends it and
+// handles the reply. done is true when the loop has ended, with its result;
+// otherwise the pending file now records the pace (L-22).
+func (s *session) step(ctx context.Context) (res Result, err error, done bool) {
+	at, last := s.nextAt, false
+	if !at.Before(s.expiresAt) {
+		at, last = s.expiresAt, true
+	}
+	if err := sleepUntil(ctx, at); err != nil {
+		return Result{}, err, true
+	}
+	status, body, over, err := s.post(ctx)
+	arrived := now()
+	if err != nil && ctx.Err() != nil {
+		return Result{}, ctx.Err(), true
+	}
+	if err == nil { // a failure to get a reply is transient
+		var b pollReply
+		readable := !over && json.Unmarshal(body, &b) == nil
+
+		switch {
+		case status == http.StatusAccepted:
+			if readable && b.Interval >= 1 {
+				s.interval = min(b.Interval, maxSeconds)
+			}
+		case status == http.StatusTooManyRequests:
+			if readable && b.Interval > s.interval {
+				s.interval = min(b.Interval, maxSeconds)
+			} else {
+				s.interval = min(s.interval+2, maxSeconds)
+			}
+		case status == http.StatusOK:
+			if over {
+				return Result{}, errors.New("key request: the 200 reply is larger than 64 KiB; nothing was stored and the request is kept"), true
+			}
+			res, err := s.approved(readable, b)
+			return res, err, true
+		case status == http.StatusForbidden:
+			s.drop()
+			return Result{}, ErrDenied, true
+		case status == http.StatusGone:
+			s.drop()
+			if readable && b.Status == "consumed" {
+				if tok, err := readToken(s.tokenPath); err == nil && tok != "" {
+					return Result{Token: tok}, nil, true
+				}
+				return Result{}, ErrConsumed, true
+			}
+			// expired, or a 410 whose body we cannot read: final either way.
+			return Result{}, ErrExpired, true
+		case status == http.StatusUnauthorized:
+			msg := ""
+			if readable {
+				msg = shown(b.Message, s.secret, maxMessage)
+			}
+			if msg == "" {
+				return Result{}, ErrUnauthorized, true
+			}
+			return Result{}, fmt.Errorf("%w: %s", ErrUnauthorized, msg), true
+		case status >= 500:
+			// transient
+		default:
+			return Result{}, fmt.Errorf("key request: poll answered unexpected status %d; the request is kept", status), true
+		}
+	}
+	if last {
+		s.drop()
+		return Result{}, ErrExpired, true
+	}
+	s.nextAt = arrived.Add(s.wait())
+	s.save()
+	return Result{}, nil, false
 }
 
 // approved stores the key of a 200. If a token has appeared at TokenPath

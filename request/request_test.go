@@ -90,6 +90,7 @@ func waitDone(t *testing.T, ep *request.ErrPending) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("background poll did not end")
 	}
+	checkReady(t, "", ep)
 }
 
 // background starts Ensure with Wait=false and returns the pending value; the
@@ -97,7 +98,7 @@ func waitDone(t *testing.T, ep *request.ErrPending) {
 func (e *env) background(ctx context.Context) *request.ErrPending {
 	e.t.Helper()
 	e.opts.Wait = false
-	_, err := request.Ensure(ctx, e.opts)
+	_, err := ensure(e.t, ctx, e.opts)
 	var ep *request.ErrPending
 	if !errors.As(err, &ep) {
 		e.t.Fatalf("Ensure(Wait=false) = %v, want *ErrPending", err)
@@ -118,7 +119,7 @@ func TestDiscoveryOverrideWins(t *testing.T) {
 	e.p.Script(keyclienttest.Approved())
 	e.opts.ServiceURL = disc.URL
 	e.opts.Override = e.p.RequestURL()
-	res, err := request.Ensure(context.Background(), e.opts)
+	res, err := ensure(t, context.Background(), e.opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +135,7 @@ func TestDiscoveryUsed(t *testing.T) {
 	e := newEnv(t)
 	e.opts.ServiceURL = e.p.URL() + "/" // trailing slash trimmed
 	e.p.Script(keyclienttest.Approved())
-	if _, err := request.Ensure(context.Background(), e.opts); err != nil {
+	if _, err := ensure(t, context.Background(), e.opts); err != nil {
 		t.Fatal(err)
 	}
 	if len(e.p.Filed()) != 1 {
@@ -145,12 +146,12 @@ func TestDiscoveryUsed(t *testing.T) {
 func TestNoProvider(t *testing.T) {
 	e := newEnv(t)
 	e.p.SetDiscovery(false)
-	_, err := request.Ensure(context.Background(), e.opts)
+	_, err := ensure(t, context.Background(), e.opts)
 	if !errors.Is(err, request.ErrNoProvider) {
 		t.Errorf("404 discovery: err = %v", err)
 	}
 	e.opts.ServiceURL = ""
-	_, err = request.Ensure(context.Background(), e.opts)
+	_, err = ensure(t, context.Background(), e.opts)
 	if !errors.Is(err, request.ErrNoProvider) {
 		t.Errorf("no ServiceURL, no Override: err = %v", err)
 	}
@@ -176,7 +177,7 @@ func TestDiscoveryFailures(t *testing.T) {
 			srv := httptest.NewServer(h)
 			defer srv.Close()
 			e.opts.ServiceURL = srv.URL
-			_, err := request.Ensure(context.Background(), e.opts)
+			_, err := ensure(t, context.Background(), e.opts)
 			if err == nil || errors.Is(err, request.ErrNoProvider) {
 				t.Errorf("err = %v, want a discovery error", err)
 			}
@@ -188,7 +189,7 @@ func TestDiscoveryFailures(t *testing.T) {
 	t.Run("network error", func(t *testing.T) {
 		e := newEnv(t)
 		e.opts.ServiceURL = "http://127.0.0.1:1"
-		_, err := request.Ensure(context.Background(), e.opts)
+		_, err := ensure(t, context.Background(), e.opts)
 		if err == nil || errors.Is(err, request.ErrNoProvider) {
 			t.Errorf("err = %v", err)
 		}
@@ -197,7 +198,7 @@ func TestDiscoveryFailures(t *testing.T) {
 		e := newEnv(t)
 		for _, o := range []string{"/relative", "ftp://x/y", "http://", "not a url"} {
 			e.opts.Override = o
-			if _, err := request.Ensure(context.Background(), e.opts); err == nil || errors.Is(err, request.ErrNoProvider) {
+			if _, err := ensure(t, context.Background(), e.opts); err == nil || errors.Is(err, request.ErrNoProvider) {
 				t.Errorf("Override %q: err = %v", o, err)
 			}
 		}
@@ -210,7 +211,7 @@ func TestDiscoveryFailures(t *testing.T) {
 func TestFilingBodyAndDefaultHost(t *testing.T) {
 	e := newEnv(t)
 	e.p.Script(keyclienttest.Approved())
-	if _, err := request.Ensure(context.Background(), e.opts); err != nil {
+	if _, err := ensure(t, context.Background(), e.opts); err != nil {
 		t.Fatal(err)
 	}
 	f := e.p.Filed()
@@ -221,7 +222,7 @@ func TestFilingBodyAndDefaultHost(t *testing.T) {
 	e = newEnv(t)
 	e.opts.Host = ""
 	e.p.Script(keyclienttest.Approved())
-	if _, err := request.Ensure(context.Background(), e.opts); err != nil {
+	if _, err := ensure(t, context.Background(), e.opts); err != nil {
 		t.Fatal(err)
 	}
 	full, _ := os.Hostname()
@@ -253,7 +254,7 @@ func TestInvalidOptionsBeforeAnyRequest(t *testing.T) {
 		e := newEnv(t)
 		e.opts.ServiceURL = "http://127.0.0.1:1"
 		c.edit(&e.opts)
-		_, err := request.Ensure(context.Background(), e.opts)
+		_, err := ensure(t, context.Background(), e.opts)
 		if err == nil || !strings.Contains(err.Error(), c.field) {
 			t.Errorf("%s: err = %v", c.field, err)
 		}
@@ -267,7 +268,7 @@ func TestProviderErrors(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	e.p.FileWith(keyclienttest.Status(400, `{"error":"bad_request","message":"role not offered"}`))
-	_, err := request.Ensure(ctx, e.opts)
+	_, err := ensure(t, ctx, e.opts)
 	var pe *request.ProviderError
 	if !errors.As(err, &pe) || pe.Status != 400 || pe.Code != "bad_request" || pe.Message != "role not offered" || pe.RetryAfter != 0 {
 		t.Fatalf("400: err = %#v", err)
@@ -277,20 +278,20 @@ func TestProviderErrors(t *testing.T) {
 	}
 
 	e.p.FileWith(keyclienttest.Status(429, `{"error":"rate_limited","message":"slow"}`).WithHeader("Retry-After", "7"))
-	_, err = request.Ensure(ctx, e.opts)
+	_, err = ensure(t, ctx, e.opts)
 	if !errors.As(err, &pe) || pe.Status != 429 || pe.RetryAfter != 7*time.Second {
 		t.Errorf("429: err = %#v", err)
 	}
 
 	e.p.FileWith(keyclienttest.Status(503, `{"error":"capacity","message":"at capacity"}`))
-	_, err = request.Ensure(ctx, e.opts)
+	_, err = ensure(t, ctx, e.opts)
 	if !errors.As(err, &pe) || pe.Status != 503 || pe.Message != "at capacity" {
 		t.Errorf("503: err = %#v", err)
 	}
 
 	// A body that is not an error object still gives a ProviderError.
 	e.p.FileWith(keyclienttest.Status(502, "<html>bad gateway</html>"))
-	_, err = request.Ensure(ctx, e.opts)
+	_, err = ensure(t, ctx, e.opts)
 	if !errors.As(err, &pe) || pe.Status != 502 {
 		t.Errorf("502: err = %#v", err)
 	}
@@ -303,7 +304,7 @@ func TestScenarios(t *testing.T) {
 	t.Run("approved", func(t *testing.T) {
 		e := newEnv(t)
 		e.p.Script(keyclienttest.Scenario("approved")...)
-		res, err := request.Ensure(context.Background(), e.opts)
+		res, err := ensure(t, context.Background(), e.opts)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -336,7 +337,7 @@ func TestScenarios(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			e := newEnv(t)
 			e.p.Script(keyclienttest.Scenario(name)...)
-			res, err := request.Ensure(context.Background(), e.opts)
+			res, err := ensure(t, context.Background(), e.opts)
 			if res != (request.Result{}) || !errors.Is(err, want) {
 				t.Fatalf("res=%+v err=%v, want %v", res, err, want)
 			}
@@ -359,7 +360,7 @@ func TestPollsHonourInterval(t *testing.T) {
 	e := newEnv(t)
 	e.p.SetInterval(2)
 	e.p.Script(keyclienttest.Pending(), keyclienttest.Pending(), keyclienttest.Approved())
-	if _, err := request.Ensure(context.Background(), e.opts); err != nil {
+	if _, err := ensure(t, context.Background(), e.opts); err != nil {
 		t.Fatal(err)
 	}
 	f, polls := e.p.Filed(), e.p.Polls()
@@ -380,7 +381,7 @@ func TestPollsHonourInterval(t *testing.T) {
 func TestSlowDownRaisesInterval(t *testing.T) {
 	e := newEnv(t) // interval 1
 	e.p.Script(keyclienttest.SlowDown(), keyclienttest.Pending(), keyclienttest.Approved())
-	if _, err := request.Ensure(context.Background(), e.opts); err != nil {
+	if _, err := ensure(t, context.Background(), e.opts); err != nil {
 		t.Fatal(err)
 	}
 	polls := e.p.Polls()
@@ -398,7 +399,7 @@ func TestSlowDownRaisesInterval(t *testing.T) {
 func TestSlowDownUnreadableBody(t *testing.T) {
 	e := newEnv(t)
 	e.p.Script(keyclienttest.Status(429, "garbage"), keyclienttest.Approved())
-	if _, err := request.Ensure(context.Background(), e.opts); err != nil {
+	if _, err := ensure(t, context.Background(), e.opts); err != nil {
 		t.Fatal(err)
 	}
 	polls := e.p.Polls()
@@ -411,7 +412,7 @@ func TestStopsAtExpiry(t *testing.T) {
 	e := newEnv(t)
 	e.p.SetExpiresIn(3)
 	start := time.Now()
-	_, err := request.Ensure(context.Background(), e.opts)
+	_, err := ensure(t, context.Background(), e.opts)
 	if !errors.Is(err, request.ErrExpired) {
 		t.Fatalf("err = %v", err)
 	}
@@ -436,7 +437,7 @@ func TestStopsAtExpiry(t *testing.T) {
 func TestTransientFailuresKeepPolling(t *testing.T) {
 	e := newEnv(t)
 	e.p.Script(keyclienttest.Status(500, ""), keyclienttest.Status(503, `{"error":"capacity","message":"x"}`), keyclienttest.Approved())
-	res, err := request.Ensure(context.Background(), e.opts)
+	res, err := ensure(t, context.Background(), e.opts)
 	if err != nil || res.Token != e.p.Key() {
 		t.Fatalf("res=%+v err=%v", res, err)
 	}
@@ -459,7 +460,7 @@ func TestConnectionFailureKeepsPolling(t *testing.T) {
 	e := newEnv(t)
 	e.opts.HTTPClient = &http.Client{Transport: &failFirstPoll{}}
 	e.p.Script(keyclienttest.Approved())
-	res, err := request.Ensure(context.Background(), e.opts)
+	res, err := ensure(t, context.Background(), e.opts)
 	if err != nil || res.Token != e.p.Key() {
 		t.Fatalf("res=%+v err=%v", res, err)
 	}
@@ -472,7 +473,7 @@ func TestOtherStatusStopsAndKeepsPending(t *testing.T) {
 	} {
 		e := newEnv(t)
 		e.p.Script(o)
-		_, err := request.Ensure(context.Background(), e.opts)
+		_, err := ensure(t, context.Background(), e.opts)
 		if err == nil {
 			t.Fatal("no error")
 		}
@@ -496,7 +497,7 @@ func TestOtherStatusStopsAndKeepsPending(t *testing.T) {
 func TestRedirectNotFollowedAtFiling(t *testing.T) {
 	e := newEnv(t)
 	e.p.FileWith(keyclienttest.Status(307, "").WithHeader("Location", e.p.RequestURL()))
-	_, err := request.Ensure(context.Background(), e.opts)
+	_, err := ensure(t, context.Background(), e.opts)
 	if err == nil || len(e.p.Filed()) != 1 {
 		t.Fatalf("err = %v, filed = %d", err, len(e.p.Filed()))
 	}
@@ -507,6 +508,9 @@ func TestRedirectNotFollowedAtFiling(t *testing.T) {
 
 func TestPendingFile(t *testing.T) {
 	e := newEnv(t)
+	// Long enough that the second run comes before its first poll is due, so
+	// it returns *ErrPending rather than the key (T-16).
+	e.p.SetInterval(5)
 	ctx, cancel := context.WithCancel(context.Background())
 	var notices []request.Notice
 	e.opts.Notify = func(n request.Notice) { notices = append(notices, n) }
@@ -526,7 +530,7 @@ func TestPendingFile(t *testing.T) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		t.Fatal(err)
 	}
-	for _, k := range []string{"request_id", "poll_url", "poll_secret", "approve_url", "user_code", "role", "tool", "interval", "expires_at", "service_url", "override", "request_url"} {
+	for _, k := range []string{"request_id", "poll_url", "poll_secret", "approve_url", "user_code", "role", "tool", "interval", "next_poll_at", "expires_at", "service_url", "override", "request_url"} {
 		if _, ok := m[k]; !ok {
 			t.Errorf("pending file lacks %q", k)
 		}
@@ -596,7 +600,7 @@ func TestExpiredPendingReplaced(t *testing.T) {
 	e := newEnv(t)
 	writePending(t, e, 0o600, pendingJSON(e, time.Now().Add(-time.Hour), "http://127.0.0.1:1/poll"))
 	e.p.Script(keyclienttest.Approved())
-	if _, err := request.Ensure(context.Background(), e.opts); err != nil {
+	if _, err := ensure(t, context.Background(), e.opts); err != nil {
 		t.Fatal(err)
 	}
 	if len(e.p.Filed()) != 1 {
@@ -612,7 +616,7 @@ func TestResumeNeedsNoDiscovery(t *testing.T) {
 	writePending(t, e, 0o600, pendingJSON(e, time.Now().Add(time.Hour), e.p.URL()+"/v1/requests/old/poll"))
 	var got request.Notice
 	e.opts.Notify = func(n request.Notice) { got = n }
-	_, err := request.Ensure(context.Background(), e.opts)
+	_, err := ensure(t, context.Background(), e.opts)
 	if !errors.Is(err, request.ErrUnauthorized) {
 		t.Fatalf("err = %v", err)
 	}
@@ -627,7 +631,7 @@ func TestResumeNeedsNoDiscovery(t *testing.T) {
 func TestPendingRefused(t *testing.T) {
 	e := newEnv(t)
 	writePending(t, e, 0o640, pendingJSON(e, time.Now().Add(time.Hour), e.p.URL()+"/poll"))
-	_, err := request.Ensure(context.Background(), e.opts)
+	_, err := ensure(t, context.Background(), e.opts)
 	if err == nil || !strings.Contains(err.Error(), request.PendingPath(e.token)) {
 		t.Errorf("group-readable: err = %v", err)
 	}
@@ -637,7 +641,7 @@ func TestPendingRefused(t *testing.T) {
 
 	e = newEnv(t)
 	writePending(t, e, 0o600, `{"poll_secret": "SECRET-NOT-TO-PRINT" oops`)
-	_, err = request.Ensure(context.Background(), e.opts)
+	_, err = ensure(t, context.Background(), e.opts)
 	if err == nil || !strings.Contains(err.Error(), request.PendingPath(e.token)) || strings.Contains(err.Error(), "SECRET-NOT-TO-PRINT") {
 		t.Errorf("corrupt: err = %v", err)
 	}
@@ -654,7 +658,7 @@ func TestBackground(t *testing.T) {
 	ctx := context.Background()
 
 	e.opts.Wait = false
-	res, err := request.Ensure(ctx, e.opts)
+	res, err := ensure(t, ctx, e.opts)
 	var ep *request.ErrPending
 	if res != (request.Result{}) || !errors.As(err, &ep) {
 		t.Fatalf("res=%+v err=%v", res, err)
@@ -683,7 +687,7 @@ func TestBackground(t *testing.T) {
 	}
 
 	// A second Ensure in the same process joins the poll: same value, no notice, no filing.
-	_, err2 := request.Ensure(ctx, e.opts)
+	_, err2 := ensure(t, ctx, e.opts)
 	var ep2 *request.ErrPending
 	if !errors.As(err2, &ep2) || ep2 != ep {
 		t.Errorf("second Ensure = %v, want the same *ErrPending", err2)
@@ -701,7 +705,7 @@ func TestBackground(t *testing.T) {
 		t.Error("token not written")
 	}
 	// Now the token is there: Ensure returns it, no request, no name or role.
-	res, err = request.Ensure(ctx, e.opts)
+	res, err = ensure(t, ctx, e.opts)
 	if err != nil || res != (request.Result{Token: e.p.Key()}) {
 		t.Errorf("after: res=%+v err=%v", res, err)
 	}
@@ -715,7 +719,7 @@ func TestWaitJoinsBackground(t *testing.T) {
 	ep := e.background(context.Background())
 	e.p.Script(keyclienttest.Approved())
 	e.opts.Wait = true
-	res, err := request.Ensure(context.Background(), e.opts)
+	res, err := ensure(t, context.Background(), e.opts)
 	if err != nil || res.Token != e.p.Key() {
 		t.Fatalf("res=%+v err=%v", res, err)
 	}
@@ -755,19 +759,19 @@ func TestExistingTokenMakesNoRequest(t *testing.T) {
 	e.opts.ServiceURL = "http://127.0.0.1:1"
 	for _, wait := range []bool{true, false} {
 		e.opts.Wait = wait
-		res, err := request.Ensure(context.Background(), e.opts)
+		res, err := ensure(t, context.Background(), e.opts)
 		if err != nil || res != (request.Result{Token: "my-token"}) {
 			t.Errorf("Wait=%v: res=%+v err=%v", wait, res, err)
 		}
 	}
 	// A token on disk wins even over URLs the package would refuse.
 	e.opts.ServiceURL = "http://provider.example"
-	if res, err := request.Ensure(context.Background(), e.opts); err != nil || res.Token != "my-token" {
+	if res, err := ensure(t, context.Background(), e.opts); err != nil || res.Token != "my-token" {
 		t.Errorf("plain http ServiceURL: res=%+v err=%v", res, err)
 	}
 	e.opts.ServiceURL = e.p.URL()
 	e.opts.Override = e.p.RequestURL()
-	if _, err := request.Ensure(context.Background(), e.opts); err != nil {
+	if _, err := ensure(t, context.Background(), e.opts); err != nil {
 		t.Fatal(err)
 	}
 	if len(e.p.Filed()) != 0 || len(e.p.Polls()) != 0 {
@@ -785,7 +789,7 @@ func TestConsumedButTokenPresent(t *testing.T) {
 		}
 	}
 	// The directory is created by the pending write.
-	res, err := request.Ensure(context.Background(), e.opts)
+	res, err := ensure(t, context.Background(), e.opts)
 	if err != nil || res != (request.Result{Token: "collected-by-other-0123456789"}) {
 		t.Fatalf("res=%+v err=%v", res, err)
 	}
@@ -798,7 +802,7 @@ func TestBadKeyWritesNothing(t *testing.T) {
 	for _, key := range []string{"short-key1", "has space in it 0123456789", strings.Repeat("k", 513), "tab\tin-key-0123456789"} {
 		e := newEnv(t)
 		e.p.Script(keyclienttest.ApprovedWith("alice@laptop", "agent", key))
-		res, err := request.Ensure(context.Background(), e.opts)
+		res, err := ensure(t, context.Background(), e.opts)
 		if err == nil || res != (request.Result{}) {
 			t.Fatalf("key %q: res=%+v err=%v", key, res, err)
 		}
@@ -822,7 +826,7 @@ func TestTokenWriteFailureRemovesPending(t *testing.T) {
 			t.Error(err)
 		}
 	}
-	res, err := request.Ensure(context.Background(), e.opts)
+	res, err := ensure(t, context.Background(), e.opts)
 	if err == nil || res != (request.Result{}) {
 		t.Fatalf("res=%+v err=%v", res, err)
 	}
@@ -838,7 +842,7 @@ func TestRealSecond(t *testing.T) {
 	token := filepath.Join(t.TempDir(), "token")
 	p.Script(keyclienttest.Approved())
 	start := time.Now()
-	res, err := request.Ensure(context.Background(), request.Options{
+	res, err := ensure(t, context.Background(), request.Options{
 		ServiceURL: p.URL(), TokenPath: token, Role: "agent", NameHint: "alice@laptop", Host: "laptop",
 		Tool: "mytool/0.3.0", Wait: true,
 	})
@@ -854,7 +858,7 @@ func TestContextCancelWait(t *testing.T) {
 	e := newEnv(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	e.opts.Notify = func(request.Notice) { cancel() }
-	_, err := request.Ensure(ctx, e.opts)
+	_, err := ensure(t, ctx, e.opts)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v", err)
 	}

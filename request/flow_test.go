@@ -31,7 +31,7 @@ func TestTwoWaitersOneProcess(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i], errs[i] = request.Ensure(context.Background(), e.opts)
+			results[i], errs[i] = ensure(t, context.Background(), e.opts)
 		}()
 	}
 	wg.Wait()
@@ -68,13 +68,13 @@ func TestWaitFalseJoinsWaitingCaller(t *testing.T) {
 	}
 	owner := make(chan out, 1)
 	go func() {
-		res, err := request.Ensure(context.Background(), e.opts)
+		res, err := ensure(t, context.Background(), e.opts)
 		owner <- out{res, err}
 	}()
 	first := <-noticed
 	o := e.opts
 	o.Wait = false
-	_, err := request.Ensure(context.Background(), o)
+	_, err := ensure(t, context.Background(), o)
 	var ep *request.ErrPending
 	if !errors.As(err, &ep) {
 		t.Fatalf("err = %v, want *ErrPending", err)
@@ -103,7 +103,7 @@ func TestDropLeavesAnotherRequestsPendingFile(t *testing.T) {
 		writePending(t, e, 0o600, pendingJSON(e, time.Now().Add(time.Hour), e.p.URL()+"/v1/requests/other/poll",
 			func(m map[string]any) { m["request_id"] = "other" }))
 	}
-	_, err := request.Ensure(context.Background(), e.opts)
+	_, err := ensure(t, context.Background(), e.opts)
 	if !errors.Is(err, request.ErrDenied) {
 		t.Fatalf("err = %v", err)
 	}
@@ -128,7 +128,7 @@ func TestApprovedKeepsATokenWrittenMeanwhile(t *testing.T) {
 			t.Error(err)
 		}
 	}
-	res, err := request.Ensure(context.Background(), e.opts)
+	res, err := ensure(t, context.Background(), e.opts)
 	if err != nil || res != (request.Result{Token: other}) {
 		t.Fatalf("res=%+v err=%v", res, err)
 	}
@@ -143,7 +143,7 @@ func TestApprovedKeepsATokenWrittenMeanwhile(t *testing.T) {
 func TestLockFile(t *testing.T) {
 	e := newEnv(t)
 	e.p.Script(keyclienttest.Approved())
-	if _, err := request.Ensure(context.Background(), e.opts); err != nil {
+	if _, err := ensure(t, context.Background(), e.opts); err != nil {
 		t.Fatal(err)
 	}
 	fi, err := os.Lstat(e.token + ".lock")
@@ -164,7 +164,7 @@ func TestPendingOfAnotherProviderDropped(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			e.opts.Notify = func(request.Notice) { cancel() }
-			if _, err := request.Ensure(ctx, e.opts); !errors.Is(err, context.Canceled) || !e.pendingExists() {
+			if _, err := ensure(t, ctx, e.opts); !errors.Is(err, context.Canceled) || !e.pendingExists() {
 				t.Fatalf("first run: err = %v, pending = %v", err, e.pendingExists())
 			}
 
@@ -176,7 +176,7 @@ func TestPendingOfAnotherProviderDropped(t *testing.T) {
 			other.Script(keyclienttest.Approved())
 			var n request.Notice
 			e.opts.Notify = func(x request.Notice) { n = x }
-			res, err := request.Ensure(context.Background(), e.opts)
+			res, err := ensure(t, context.Background(), e.opts)
 			if err != nil || res.Token != other.Key() {
 				t.Fatalf("second run: res=%+v err=%v", res, err)
 			}
@@ -192,12 +192,12 @@ func TestPendingOfAnotherProviderDropped(t *testing.T) {
 		e := newEnv(t)
 		ctx, cancel := context.WithCancel(context.Background())
 		e.opts.Notify = func(request.Notice) { cancel() }
-		request.Ensure(ctx, e.opts)
+		ensure(t, ctx, e.opts)
 		e.opts.ServiceURL = e.p.URL() + "/"
 		e.p.Script(keyclienttest.Approved())
 		var n request.Notice
 		e.opts.Notify = func(x request.Notice) { n = x }
-		if _, err := request.Ensure(context.Background(), e.opts); err != nil {
+		if _, err := ensure(t, context.Background(), e.opts); err != nil {
 			t.Fatal(err)
 		}
 		if !n.Resumed || len(e.p.Filed()) != 1 {
@@ -213,7 +213,7 @@ func TestExpiresInClamped(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var n request.Notice
 	e.opts.Notify = func(x request.Notice) { n = x; cancel() }
-	request.Ensure(ctx, e.opts)
+	ensure(t, ctx, e.opts)
 	if d := time.Until(n.ExpiresAt); d > 24*time.Hour || d < 23*time.Hour {
 		t.Errorf("expires in %v, want 24h", d)
 	}
@@ -233,7 +233,7 @@ func TestPollsOnceMoreAtExpiry(t *testing.T) {
 	e.p.SetInterval(5)
 	e.p.SetExpiresIn(12)
 	start := time.Now()
-	_, err := request.Ensure(context.Background(), e.opts)
+	_, err := ensure(t, context.Background(), e.opts)
 	if !errors.Is(err, request.ErrExpired) {
 		t.Fatalf("err = %v", err)
 	}
@@ -260,7 +260,7 @@ func TestPollsOnceMoreAtExpiry(t *testing.T) {
 	t.Cleanup(request.SetSecond(time.Millisecond))
 	e.p.SetInterval(600)
 	e.p.SetExpiresIn(600)
-	_, err = request.Ensure(context.Background(), e.opts)
+	_, err = ensure(t, context.Background(), e.opts)
 	if !errors.Is(err, request.ErrExpired) || len(e.p.Polls()) != 1 {
 		t.Errorf("err = %v, polls = %d, want ErrExpired after one poll", err, len(e.p.Polls()))
 	}

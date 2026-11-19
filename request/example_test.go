@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/resurgentech/keyclient/request"
 )
@@ -106,4 +107,42 @@ func ExampleEnsure_background() {
 	// pending, code BCDF-GHJK ready: false
 	// ready: true err: <nil>
 	// token length 45 name "" err: <nil>
+}
+
+// A tool whose output is not a terminal prints the notice and exits. Run again
+// once the next poll is due (the pending file records when), Ensure makes that
+// poll before it returns; the request being approved, it returns the key.
+func ExampleEnsure_printAndExit() {
+	srv := exampleProvider()
+	defer srv.Close()
+	dir, _ := os.MkdirTemp("", "keyclient-example-")
+	defer os.RemoveAll(dir)
+
+	opts := request.Options{
+		ServiceURL: srv.URL,
+		TokenPath:  filepath.Join(dir, "token"),
+		Role:       "agent",
+		NameHint:   "alice@laptop",
+		Tool:       "mytool/0.3.0",
+		Wait:       false, // request.IsTerminal(os.Stderr) in real code
+	}
+	for run := 1; run <= 3; run++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		res, err := request.Ensure(ctx, opts)
+		var pending *request.ErrPending
+		if errors.As(err, &pending) {
+			// A real tool prints pending.Notice.String() and exits.
+			fmt.Println("run", run, "pending, code", pending.Notice.UserCode, "resumed:", pending.Notice.Resumed)
+			cancel() // the process exits: its background poll ends
+			<-pending.Done()
+			time.Sleep(1100 * time.Millisecond) // the next run comes after the interval (1s here)
+			continue
+		}
+		cancel()
+		fmt.Println("run", run, "token length", len(res.Token), "err:", err)
+		return
+	}
+	// Output:
+	// run 1 pending, code BCDF-GHJK resumed: false
+	// run 2 token length 45 err: <nil>
 }

@@ -22,6 +22,15 @@
 //     notice, and the next call of Ensure finds the token (or, while the poll
 //     runs in this process, gets the same *ErrPending). Pass a context that
 //     outlives the call: the context of one incoming request ends too soon.
+//     A tool that prints the notice and exits still collects its key: the
+//     pending file records when the next poll is due, and a later call makes
+//     that poll before it returns once it is due, returning the key if the
+//     request was approved. A call with Wait false never waits for a person
+//     or for another process; only the time limits of its network calls
+//     bound it.
+//
+// Notice.ApproveURL comes from the provider. Never pass it (or
+// Notice.String()) to a shell or a URL opener without the user's consent.
 //
 // # Trust and transport
 //
@@ -41,47 +50,80 @@
 //
 // What the provider sends is checked before anything is shown, stored or
 // polled: a 201 whose request_id, user_code or approve_url breaks the contract's
-// rules, or holds the poll secret, is refused. Text from the provider that is
+// rules, or holds the poll secret (as it is, or URL-escaped), is refused. Text from the provider that is
 // shown (a [ProviderError]'s Code and Message, the message of a 401) is reduced
 // to printable characters first, and the poll secret is then redacted from it.
 //
 // # One flow per token
 //
-// Ensure takes an exclusive lock (flock) on TokenPath + ".lock" before it reads
-// the token and pending files, and holds it until the flow ends, so two
-// processes never file two requests or poll one request at once: the second
-// waits (bounded by its context), then finds the token the first stored. With
-// Wait false the lock is released when Ensure returns the *ErrPending; the
-// background poll then goes on under this process's own bookkeeping only, so
-// another process that starts meanwhile may resume and poll the same request.
+// The states and transitions this package follows are written out, row by
+// row, in docs/STATES.md (machines 2 and 3); the tests are named after those
+// rows.
+//
+// A token on disk is returned without the lock, and nothing else is touched.
+// Otherwise the order is:
+//
+//  1. When the request URL must come from discovery (no Override) and there is
+//     no pending file, discovery runs first, without the lock: a service
+//     without a provider ([ErrNoProvider]) leaves nothing on disk, not even
+//     the directory.
+//  2. Ensure takes an exclusive lock (flock) on TokenPath + ".lock", making the
+//     file (and its directory) when missing, and holds it until the flow ends:
+//     with Wait false, until the background poll ends. So two processes never
+//     file two requests or poll one request at once.
+//  3. Under the lock it removes the temporary files an interrupted write of
+//     the token or pending file left, reads the token file again (a token
+//     another holder stored is returned, and a pending file left beside it by
+//     a crash is removed), then resumes the request in the pending file or
+//     files a new one. A pending file that appeared since step 1 is resumed
+//     and the discovered URL is not used; one of another ServiceURL or
+//     Override is removed and the discovered URL is used.
+//
+// When another process holds the lock: with Wait true, Ensure shows the notice
+// of the request in the pending file (marked resumed) once, waits for the lock
+// (bounded by its context), then finds the token or resumes that request
+// without showing it again. With Wait false it returns at once: an
+// *ErrPending built from the pending file, whose background goroutine waits
+// for the lock and then does the same; or [ErrBusy] when the pending file
+// holds no current request.
+//
 // Within one process, callers for one TokenPath join the running flow: no
 // second filing and no second notice. Key requests need the lock: on platforms
 // other than Linux, macOS and the BSDs, Ensure returns a token already on disk
-// but reports that key requests are not supported instead of filing or
-// resuming one.
+// but returns an error that wraps errors.ErrUnsupported instead of filing or
+// resuming one. A file system without flock fails closed the same way: the
+// error names the lock file, and nothing is filed.
 //
 // What lands on disk:
 //
 //   - TokenPath: the key, mode 0600, written atomically. Its directory is
 //     created with mode 0700 when it does not exist.
 //   - TokenPath + ".lock": an empty file, mode 0600, the lock. It is left in
-//     place.
+//     place. A lock file that is a link, not a regular file, not owned by the
+//     user, or writable by group or others is refused with an error that
+//     names it.
 //   - TokenPath + ".pending" ([PendingPath]): mode 0600, while a request is open.
 //     It holds the request id, poll URL, poll secret, approve URL, user code,
-//     role, tool, interval, expiry, and the ServiceURL, Override and request URL
-//     it was filed with, so that a later run resumes the request instead of
-//     filing a second one. A later run with another ServiceURL or Override
-//     drops it and files anew. Its values are checked again when it is resumed;
-//     a file that is not a regular file of mode 0600, or whose values break the
-//     rules, is refused. It is removed once the request settles (key stored,
-//     denied, expired, consumed) or expires, and only while it still holds that
-//     request. It is kept when the tool stops without a verdict (context ended,
-//     401, an unexpected status).
+//     role, tool, the current interval and when the next poll is due
+//     (rewritten after each poll that keeps the request open), the expiry, and
+//     the ServiceURL, Override and request URL it was filed with, so that a
+//     later run resumes the request, at the same pace, instead of filing a
+//     second one. A later run with another ServiceURL or Override drops it and
+//     files anew. Its values are checked again when it is resumed; a file that
+//     is not a regular file of mode 0600 owned by the user, or whose values
+//     break the rules, is refused. A next poll time in the past (or none, in a
+//     file of an older version) means now; one further away than the interval
+//     means one interval from now. It is removed once the request settles (key
+//     stored, denied, expired, consumed) or expires, and only while it still
+//     holds that request. It is kept when the tool stops without a verdict
+//     (context ended, 401, an unexpected status). Only the lock holder writes
+//     or removes it.
 //
 // Limits: each HTTP call is bounded by [RequestTimeout], and at most
 // [MaxReply] bytes of a reply are read. The request is treated as expired at
-// most 24 hours after it was filed, whatever expires_in says. When the next
-// poll would fall after the expiry, the tool polls once more at the expiry.
+// most 24 hours after it was filed (or, when resumed, from now), whatever
+// expires_in says. When the next poll would fall after the expiry, the tool
+// polls once more at the expiry.
 //
 // The poll secret and the key are written to the pending and token files and
 // nowhere else: no error, [Notice] or [ErrPending] text ever contains either.

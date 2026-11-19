@@ -11,15 +11,12 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
-
-	"github.com/resurgentech/keyclient/internal/atomicfile"
 )
 
 const (
@@ -50,11 +47,25 @@ var (
 	// ErrUnauthorized means the provider refused the poll secret (401). The
 	// request is kept.
 	ErrUnauthorized = errors.New("key request: poll refused as unauthorized")
+	// ErrBusy is returned with Wait false when another process holds the lock
+	// of this token and there is no request of this run's service in the
+	// pending file to report: that process is filing one, or is about to end.
+	// Nothing was filed or shown. Call Ensure again shortly. It is also the
+	// end of the background wait of a Wait false call (see [ErrPending]) when,
+	// once the lock is free, the request it reported has ended in that other
+	// process without a token here.
+	ErrBusy = errors.New("key request: another process is handling a key request for this token; try again shortly")
 )
 
 // errUnsupported is returned where a request would be filed or resumed on a
-// platform without the file lock.
-var errUnsupported = errors.New("key request: key requests are not supported on this platform")
+// platform without the file lock. It wraps errors.ErrUnsupported.
+var errUnsupported = fmt.Errorf("key request: key requests are not supported on this platform: %w", errors.ErrUnsupported)
+
+// hostname is the source of the default Host; tests replace it.
+var hostname = os.Hostname
+
+// getuid is the user that must own the lock and pending files; tests replace it.
+var getuid = os.Getuid
 
 // second is the unit of intervals and of expires_in; tests shrink it.
 var second = time.Second
@@ -124,7 +135,9 @@ type Options struct {
 	Role string
 	// NameHint is required, for example user@host.
 	NameHint string
-	// Host is optional; the default is os.Hostname() up to the first dot.
+	// Host is optional; the default is os.Hostname() up to the first dot. The
+	// key's name needs one: when the default is empty or breaks the rule
+	// ^[A-Za-z0-9_.-]{1,64}$, Ensure returns an error that names Host.
 	Host string
 	// Tool is required: tool name and version, for example mytool/0.3.0.
 	Tool string
@@ -132,8 +145,19 @@ type Options struct {
 	// followed: a 3xx is "any other status".
 	HTTPClient *http.Client
 	// Notify is called once per Ensure that files or resumes a request, before
-	// polling. Nil: nothing. A caller that joins a flow already running in
-	// this process is not notified again.
+	// polling, in the caller's goroutine. It is also called, with a notice
+	// marked resumed, when another process holds the lock and the pending file
+	// holds its request: then before waiting for that lock (Wait true) or
+	// before returning *ErrPending (Wait false); a request shown this way is
+	// not shown again when this call resumes it. Nil: nothing. A caller that
+	// joins a flow already running in this process is not notified again. A
+	// panic in Notify reaches the caller of Ensure; the flow ends with an error
+	// for every caller that joined it, the lock is released and the pending
+	// file kept.
+	//
+	// The notice holds a URL from the provider. Never pass Notice.ApproveURL
+	// (or Notice.String()) to a shell or a URL opener without the user's
+	// consent.
 	Notify func(Notice)
 	// AllowInsecureHTTP allows plain http to any host for ServiceURL, Override
 	// and the URLs the provider gives (request_url, poll_url, approve_url). By
@@ -152,7 +176,12 @@ type Options struct {
 	// gives that up, so set it only for a network path you trust.
 	AllowInsecureHTTP bool
 	// Wait true polls until the request settles. False returns *ErrPending
-	// once the request is filed or resumed, and polls in the background.
+	// once the request is filed or resumed, and polls in the background,
+	// holding the lock until that poll ends; when a poll of a resumed request
+	// is already due, that one poll is made first, and if it settles the
+	// request its result is returned instead. A call with Wait false never
+	// waits for a person or for another process: only the time limits of its
+	// network calls bound it.
 	Wait bool
 }
 
@@ -176,7 +205,15 @@ type Result struct {
 // Notice is what the user is told when a request is filed or resumed. Every
 // field comes from validated values: the 201 reply (or the pending file) and
 // the options.
+//
+// ApproveURL comes from the provider. Never pass it (or String()) to a shell or
+// a URL opener without the user's consent.
 type Notice struct {
+	// Service is the host (and port, if any) of the service the key is for:
+	// the host of ServiceURL, or of Override when Override is used. It comes
+	// from the configuration, not from the provider; a resumed notice takes it
+	// from the pending file, which records both.
+	Service    string
 	ApproveURL string
 	UserCode   string
 	Role       string // asked for
@@ -186,11 +223,16 @@ type Notice struct {
 }
 
 // String is the one message for the user: approve at ApproveURL and check that
-// the code UserCode matches, with the role and tool asked for and when the
-// request expires. It never holds the poll URL, the poll secret or a key.
+// the code UserCode matches, with the service, the role and tool asked for and
+// when the request expires. It never holds the poll URL, the poll secret or a
+// key.
 func (n Notice) String() string {
-	s := fmt.Sprintf("Approve this key request at %s and check that the code %s matches. Asked for: role %s, tool %s. The request expires at %s.",
-		n.ApproveURL, n.UserCode, n.Role, n.Tool, n.ExpiresAt.UTC().Format(time.RFC3339))
+	what := "this key request"
+	if n.Service != "" {
+		what = "this key request for " + n.Service
+	}
+	s := fmt.Sprintf("Approve %s at %s and check that the code %s matches. Asked for: role %s, tool %s. The request expires at %s.",
+		what, n.ApproveURL, n.UserCode, n.Role, n.Tool, n.ExpiresAt.UTC().Format(time.RFC3339))
 	if n.Resumed {
 		s = "Resuming an earlier key request. " + s
 	}
@@ -199,7 +241,14 @@ func (n Notice) String() string {
 
 // ErrPending is returned by [Ensure] with Wait false after it filed or resumed
 // a request, or when it joins a flow already running in this process. The
-// poll goes on in the background.
+// poll goes on in the background and holds the lock until it ends.
+//
+// It is also returned, at once, when another process holds the lock and the
+// pending file holds a current request: its Notice is built from that file
+// (Resumed is true), and a background goroutine waits for the lock (bounded by
+// the context), then returns the token another holder stored, or resumes and
+// polls that same request. If that request has ended without a token here, Err
+// is [ErrBusy].
 type ErrPending struct {
 	Notice Notice
 
@@ -256,146 +305,12 @@ type pendingFile struct {
 	UserCode   string    `json:"user_code"`
 	Role       string    `json:"role"`
 	Tool       string    `json:"tool"`
-	Interval   int       `json:"interval"`
+	Interval   int       `json:"interval"`     // the current interval I (L-22)
+	NextPollAt time.Time `json:"next_poll_at"` // when the next poll is due (L-22); absent in older files: now
 	ExpiresAt  time.Time `json:"expires_at"`
 	ServiceURL string    `json:"service_url"` // the ServiceURL of the run that filed it, trailing / trimmed
 	Override   string    `json:"override"`    // the Override of that run
 	RequestURL string    `json:"request_url"` // where it was filed
-}
-
-// Ensure returns the tool's token. If TokenPath holds one it is returned and
-// nothing else happens. Otherwise, when a request URL is known, it files a key
-// request (or resumes the one kept in the pending file), calls Notify once and
-// polls; see the package documentation and docs/CONTRACT.md.
-//
-// With Wait false the returned error is an *[ErrPending] right after filing or
-// resuming; the poll then runs in a goroutine until ctx ends, so ctx must
-// outlive the call. Waiting for the lock that another process holds is bounded
-// by ctx too, with Wait false as with Wait true.
-func Ensure(ctx context.Context, o Options) (Result, error) {
-	host, err := o.validate()
-	if err != nil {
-		return Result{}, err
-	}
-	tokenPath := filepath.Clean(o.TokenPath)
-	if tok, err := readToken(tokenPath); err != nil || tok != "" {
-		return Result{Token: tok}, err
-	}
-	pol := policy{insecure: o.AllowInsecureHTTP}
-	switch {
-	case o.Override != "":
-		_, pol, err = pol.check("Override", o.Override)
-	case o.ServiceURL != "":
-		_, pol, err = pol.check("ServiceURL", o.ServiceURL)
-	default:
-		return Result{}, ErrNoProvider
-	}
-	if err != nil {
-		return Result{}, err
-	}
-	for {
-		f, owner := startOrJoin(tokenPath)
-		if owner {
-			return o.own(ctx, f, tokenPath, host, pol)
-		}
-		res, err, again := f.join(ctx, o.Wait)
-		if !again {
-			return res, err
-		}
-	}
-}
-
-// own runs the flow of f: it takes the lock, then resumes or files, notifies
-// and polls.
-func (o Options) own(ctx context.Context, f *flight, tokenPath, host string, pol policy) (res Result, err error) {
-	handedOff := false
-	defer func() {
-		if !handedOff {
-			f.finish(res, err) // a no-op if already finished; also covers a panic in Notify
-		}
-	}()
-	unlock, err := lockFile(ctx, tokenPath+lockExt)
-	if err != nil {
-		return Result{}, err
-	}
-	locked := true
-	release := func() {
-		if locked {
-			locked = false
-			unlock()
-		}
-	}
-	defer release()
-
-	if tok, err := readToken(tokenPath); err != nil || tok != "" {
-		return Result{Token: tok}, err
-	}
-	s, notice, err := o.start(ctx, tokenPath, host, pol)
-	if err != nil {
-		return Result{}, err
-	}
-	ep := f.pending(notice)
-	if o.Notify != nil {
-		o.Notify(notice)
-	}
-	if o.Wait {
-		res, err := s.run(ctx)
-		f.finish(res, err)
-		return res, err
-	}
-	// Wait false: the lock is released here; the background poll goes on
-	// under the in-process table only.
-	release()
-	handedOff = true
-	go func() {
-		res, err := s.run(ctx)
-		f.finish(res, err)
-	}()
-	return Result{}, ep
-}
-
-// start resumes the pending request, or files a new one and stores it. The
-// caller holds the lock.
-func (o Options) start(ctx context.Context, tokenPath, host string, pol policy) (*session, Notice, error) {
-	unit := second
-	client := o.client()
-	pendPath := PendingPath(tokenPath)
-	s := &session{client: client, tokenPath: tokenPath, pendPath: pendPath, unit: unit}
-	serviceURL := strings.TrimRight(o.ServiceURL, "/")
-
-	pf, resumed, err := loadPending(pendPath, serviceURL, o.Override, pol, unit)
-	if err != nil {
-		return nil, Notice{}, err
-	}
-	var arrived time.Time
-	if resumed {
-		arrived = now()
-	} else {
-		reqURL, rpol := o.Override, pol
-		if reqURL == "" {
-			if reqURL, rpol, err = o.discover(ctx, client, pol); err != nil {
-				return nil, Notice{}, err
-			}
-		}
-		var c created
-		c, arrived, err = fileRequest(ctx, client, reqURL, rpol, o, host)
-		if err != nil {
-			return nil, Notice{}, err
-		}
-		pf = c.pendingFile
-		pf.ExpiresAt = arrived.Add(time.Duration(min(c.expiresIn, maxExpiresIn)) * unit)
-		pf.ServiceURL, pf.Override, pf.RequestURL = serviceURL, o.Override, reqURL
-		data, err := json.Marshal(pf)
-		if err != nil {
-			return nil, Notice{}, err
-		}
-		if err := atomicfile.Write(pendPath, data); err != nil {
-			return nil, Notice{}, fmt.Errorf("key request: cannot store the pending request: %w", err)
-		}
-	}
-	s.requestID, s.pollURL, s.secret, s.interval, s.expiresAt = pf.RequestID, pf.PollURL, pf.PollSecret, pf.Interval, pf.ExpiresAt
-	s.nextAt = arrived.Add(s.wait())
-	return s, Notice{ApproveURL: pf.ApproveURL, UserCode: pf.UserCode, Role: pf.Role, Tool: pf.Tool, ExpiresAt: pf.ExpiresAt, Resumed: resumed}, nil
 }
 
 // readToken returns the trimmed content of path; "" when it is missing or empty.
@@ -443,11 +358,14 @@ func (o Options) validate() (host string, err error) {
 	}
 	host = o.Host
 	if host == "" {
-		full, err := os.Hostname()
+		full, err := hostname()
 		if err != nil {
-			return "", fmt.Errorf("key request: Host not set and the hostname is unknown: %w", err)
+			return "", fmt.Errorf("key request: Host is not set and the hostname is unknown (%v); set Host", err)
 		}
 		host, _, _ = strings.Cut(full, ".")
+		if !reHost.MatchString(host) {
+			return "", fmt.Errorf("key request: Host is not set and the short hostname %q is empty or breaks the rule %s; set Host", sanitize(host, 64), reHost)
+		}
 	}
 	if !reHost.MatchString(host) {
 		return "", fmt.Errorf("key request: Host breaks the rule %s", reHost)
@@ -646,10 +564,62 @@ func checkRequest(pol policy, requestID, pollURL, secret, approveURL, userCode s
 	if _, _, err := pol.check("poll_url", pollURL); err != nil {
 		return strings.TrimPrefix(err.Error(), "key request: ")
 	}
-	if strings.Contains(requestID, secret) || strings.Contains(approveURL, secret) || strings.Contains(userCode, secret) {
+	if holdsSecret(requestID, secret) || holdsSecret(approveURL, secret) || holdsSecret(userCode, secret) {
 		return "request_id, approve_url or user_code holds the poll secret"
 	}
 	return ""
+}
+
+// holdsSecret reports whether s holds secret as it is, or once URL-unescaped
+// as a path or as a query (where + is a space). Unescaping is lenient (a broken
+// escape is kept as it is, so it cannot hide the rest) and repeated until
+// nothing changes (so escaping twice hides nothing either).
+func holdsSecret(s, secret string) bool {
+	for _, plus := range []bool{false, true} {
+		for v := s; ; {
+			if strings.Contains(v, secret) {
+				return true
+			}
+			u := unescape(v, plus)
+			if u == v {
+				break
+			}
+			v = u
+		}
+	}
+	return false
+}
+
+// unescape decodes each valid %XX of s, and with plus each + as a space;
+// everything else is kept.
+func unescape(s string, plus bool) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]):
+			b.WriteByte(unhex(s[i+1])<<4 | unhex(s[i+2]))
+			i += 2
+		case c == '+' && plus:
+			b.WriteByte(' ')
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+func isHex(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+func unhex(c byte) byte {
+	switch {
+	case c <= '9':
+		return c - '0'
+	case c <= 'F':
+		return c - 'A' + 10
+	}
+	return c - 'a' + 10
 }
 
 // printableASCII reports whether s is not empty and every byte is 0x21 to 0x7e.
@@ -683,6 +653,9 @@ func readPending(path string) (b []byte, exists bool, err error) {
 	if !fi.Mode().IsRegular() || fi.Mode().Perm()&0o077 != 0 {
 		return nil, true, fmt.Errorf("key request: the pending file %s must be a regular file readable only by its owner (mode 0600); fix its mode or remove it", path)
 	}
+	if !ownedByMe(fi) {
+		return nil, true, fmt.Errorf("key request: the pending file %s is not owned by this user; remove it", path)
+	}
 	b, over, err := readReply(f)
 	if err != nil || over {
 		return nil, true, fmt.Errorf("key request: the pending file %s cannot be used; remove it (unreadable, or larger than 64 KiB)", path)
@@ -690,39 +663,56 @@ func readPending(path string) (b []byte, exists bool, err error) {
 	return b, true, nil
 }
 
-// loadPending reads the pending file. resumed is false when there is none, or
-// when it is for another ServiceURL or Override, or has expired: then it is
-// removed (the caller holds the lock). serviceURL is trimmed of a trailing /.
-func loadPending(path, serviceURL, override string, pol policy, unit time.Duration) (pf pendingFile, resumed bool, err error) {
+// The states of the pending file P that parsePending tells apart (STATES.md,
+// machine 2); unusable is an error.
+const (
+	pendingAbsent  = iota
+	pendingCurrent // filed for this run's service URL and override, not expired
+	pendingStale   // foreign (another service URL or override) or expired
+)
+
+// parsePending reads the pending file and tells its state. It changes nothing.
+// serviceURL is trimmed of a trailing /. A current file has its interval and
+// expiry clamped.
+func parsePending(path, serviceURL, override string, pol policy, unit time.Duration) (pf pendingFile, state int, err error) {
 	b, exists, err := readPending(path)
 	if err != nil || !exists {
-		return pf, false, err
+		return pf, pendingAbsent, err
 	}
 	bad := func(why string) error {
 		return fmt.Errorf("key request: the pending file %s cannot be used; remove it (%s)", path, why)
 	}
 	if json.Unmarshal(b, &pf) != nil {
-		return pendingFile{}, false, bad("not valid JSON of the expected shape")
+		return pendingFile{}, pendingAbsent, bad("not valid JSON of the expected shape")
 	}
 	if pf.ServiceURL != serviceURL || pf.Override != override || !now().Before(pf.ExpiresAt) {
-		os.Remove(path)
-		return pendingFile{}, false, nil
+		return pendingFile{}, pendingStale, nil
 	}
 	if !reRole.MatchString(pf.Role) || !reTool.MatchString(pf.Tool) || pf.Interval < 1 {
-		return pendingFile{}, false, bad("role, tool or interval breaks its rule")
+		return pendingFile{}, pendingAbsent, bad("role, tool or interval breaks its rule")
 	}
 	_, rpol, err := pol.check("request_url", pf.RequestURL)
 	if err != nil {
-		return pendingFile{}, false, bad(strings.TrimPrefix(err.Error(), "key request: "))
+		return pendingFile{}, pendingAbsent, bad(strings.TrimPrefix(err.Error(), "key request: "))
 	}
 	if why := checkRequest(rpol, pf.RequestID, pf.PollURL, pf.PollSecret, pf.ApproveURL, pf.UserCode); why != "" {
-		return pendingFile{}, false, bad(why)
+		return pendingFile{}, pendingAbsent, bad(why)
 	}
 	pf.Interval = min(pf.Interval, maxSeconds)
 	if limit := now().Add(maxExpiresIn * unit); pf.ExpiresAt.After(limit) {
 		pf.ExpiresAt = limit
 	}
-	return pf, true, nil
+	return pf, pendingCurrent, nil
+}
+
+// loadPending reads the pending file under the lock. resumed is false when
+// there is none, or when it is foreign or expired: then it is removed (T-12).
+func loadPending(path, serviceURL, override string, pol policy, unit time.Duration) (pf pendingFile, resumed bool, err error) {
+	pf, state, err := parsePending(path, serviceURL, override, pol, unit)
+	if state == pendingStale {
+		os.Remove(path)
+	}
+	return pf, state == pendingCurrent, err
 }
 
 // sanitize keeps printable characters, turns other white space into a space,

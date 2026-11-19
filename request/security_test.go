@@ -91,7 +91,7 @@ func TestPlainHTTPRefusedUnlessLoopback(t *testing.T) {
 				e.opts.Override = c.url
 			}
 			e.opts.AllowInsecureHTTP = allow
-			_, err := request.Ensure(context.Background(), e.opts)
+			_, err := ensure(t, context.Background(), e.opts)
 			if err == nil {
 				t.Fatalf("%s %s allow=%v: no error", c.field, c.url, allow)
 			}
@@ -120,7 +120,7 @@ func TestBadServiceURLBeforeAnyRequest(t *testing.T) {
 		rec := &recorder{}
 		e.opts.HTTPClient = &http.Client{Transport: rec}
 		e.opts.ServiceURL = u
-		_, err := request.Ensure(context.Background(), e.opts)
+		_, err := ensure(t, context.Background(), e.opts)
 		if err == nil || !strings.Contains(err.Error(), "ServiceURL") || errors.Is(err, request.ErrNoProvider) {
 			t.Errorf("ServiceURL %q: err = %v", u, err)
 		}
@@ -142,7 +142,7 @@ func TestNoDowngrade(t *testing.T) {
 			e.opts.ServiceURL = disc.URL
 			e.opts.HTTPClient = disc.Client()
 			e.opts.AllowInsecureHTTP = allow
-			_, err := request.Ensure(context.Background(), e.opts)
+			_, err := ensure(t, context.Background(), e.opts)
 			if err == nil || !strings.Contains(err.Error(), "not https") {
 				t.Errorf("allow=%v: err = %v", allow, err)
 			}
@@ -171,7 +171,7 @@ func TestNoDowngrade(t *testing.T) {
 			e.opts.AllowInsecureHTTP = allow
 			notified := false
 			e.opts.Notify = func(request.Notice) { notified = true }
-			_, err := request.Ensure(context.Background(), e.opts)
+			_, err := ensure(t, context.Background(), e.opts)
 			if err == nil || !strings.Contains(err.Error(), "not https") {
 				t.Errorf("allow=%v: err = %v", allow, err)
 			}
@@ -195,7 +195,7 @@ func TestNoDowngrade(t *testing.T) {
 		e := newEnv(t)
 		e.opts.ServiceURL = disc.URL
 		e.opts.HTTPClient = reqSrv.Client()
-		_, err := request.Ensure(context.Background(), e.opts)
+		_, err := ensure(t, context.Background(), e.opts)
 		if err == nil || !strings.Contains(err.Error(), "not https") {
 			t.Errorf("err = %v", err)
 		}
@@ -224,7 +224,7 @@ func TestPollURLMustBeHTTPSWhenRequestURLIs(t *testing.T) {
 		e.opts.HTTPClient = srv.Client()
 		e.opts.AllowInsecureHTTP = allow
 		start := time.Now()
-		_, err := request.Ensure(context.Background(), e.opts)
+		_, err := ensure(t, context.Background(), e.opts)
 		if d := time.Since(start); d > 500*time.Millisecond {
 			t.Errorf("allow=%v: took %v, want well under one interval (1s)", allow, d)
 		}
@@ -284,7 +284,7 @@ func TestInvalid201Replies(t *testing.T) {
 		e.p.FileWith(keyclienttest.Status(201, created201(loop+"/poll", loop+"/a", c.edit)))
 		notified := false
 		e.opts.Notify = func(request.Notice) { notified = true }
-		_, err := request.Ensure(context.Background(), e.opts)
+		_, err := ensure(t, context.Background(), e.opts)
 		if err == nil || strings.Contains(err.Error(), "s3cr3t") {
 			t.Errorf("%s: err = %v", c.name, err)
 		}
@@ -303,7 +303,7 @@ func TestInvalid201Replies(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		var got request.Notice
 		e.opts.Notify = func(n request.Notice) { got = n; cancel() }
-		_, err := request.Ensure(ctx, e.opts)
+		_, err := ensure(t, ctx, e.opts)
 		if !errors.Is(err, context.Canceled) || got.UserCode != "AAAA-BBBB" {
 			t.Errorf("%s: err = %v, notice = %+v", name, err, got)
 		}
@@ -335,7 +335,7 @@ func TestResumedPendingRevalidated(t *testing.T) {
 		writePending(t, e, 0o600, pendingJSON(e, time.Now().Add(time.Hour), e.p.URL()+"/v1/requests/old/poll", c.edit))
 		notified := false
 		e.opts.Notify = func(request.Notice) { notified = true }
-		_, err := request.Ensure(context.Background(), e.opts)
+		_, err := ensure(t, context.Background(), e.opts)
 		if err == nil || !strings.Contains(err.Error(), "cannot be used; remove it") || strings.Contains(err.Error(), secret) {
 			t.Errorf("%s: err = %v", c.name, err)
 		}
@@ -350,7 +350,7 @@ func TestPendingNotARegularFile(t *testing.T) {
 	if err := os.MkdirAll(request.PendingPath(e.token), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	_, err := request.Ensure(context.Background(), e.opts)
+	_, err := ensure(t, context.Background(), e.opts)
 	// Refused by the regular-file rule itself, not by a later read error.
 	if err == nil || !strings.Contains(err.Error(), request.PendingPath(e.token)) || !strings.Contains(err.Error(), "must be a regular file") {
 		t.Errorf("a directory: err = %v", err)
@@ -365,7 +365,7 @@ func TestProviderMessageSanitised(t *testing.T) {
 	msg := "a\u0007b\x1b[31mred\nline‮" + strings.Repeat("x", 300)
 	b, _ := json.Marshal(map[string]string{"error": "bad\x1b[2K_request", "message": msg})
 	e.p.FileWith(keyclienttest.Status(400, string(b)))
-	_, err := request.Ensure(context.Background(), e.opts)
+	_, err := ensure(t, context.Background(), e.opts)
 	var pe *request.ProviderError
 	if !errors.As(err, &pe) {
 		t.Fatalf("err = %v", err)
@@ -387,7 +387,7 @@ func TestUnauthorizedMessageSanitised(t *testing.T) {
 	msg := "no\u0007such\x1b[31mrequest\nhere‮" + strings.Repeat("x", 300)
 	b, _ := json.Marshal(map[string]string{"error": "unauthorized", "message": msg})
 	e.p.Script(keyclienttest.Status(401, string(b)))
-	_, err := request.Ensure(context.Background(), e.opts)
+	_, err := ensure(t, context.Background(), e.opts)
 	if !errors.Is(err, request.ErrUnauthorized) {
 		t.Fatalf("err = %v", err)
 	}
@@ -473,7 +473,7 @@ func TestSecretsNeverLeak(t *testing.T) {
 				}
 				var err error
 				if wait {
-					_, err = request.Ensure(context.Background(), e.opts)
+					_, err = ensure(t, context.Background(), e.opts)
 				} else {
 					ep := e.background(context.Background())
 					waitDone(t, ep)
@@ -496,7 +496,7 @@ func TestSecretsNeverLeak(t *testing.T) {
 				b, _ := json.Marshal(map[string]string{"error": sec, "message": sec, "status": sec})
 				e.p.Script(keyclienttest.Status(status, string(b)).WithHeader("Location", "http://127.0.0.1:1/"+sec).WithHeader("X-Echo", sec))
 			}
-			_, err := request.Ensure(context.Background(), e.opts)
+			_, err := ensure(t, context.Background(), e.opts)
 			if err == nil {
 				t.Fatalf("%d: no error", status)
 			}
@@ -518,7 +518,7 @@ func TestSecretsNeverLeak(t *testing.T) {
 					func(m map[string]any) { m["poll_secret"] = sec }, edit)).WithHeader("X-Echo", sec))
 				var notice *request.Notice
 				e.opts.Notify = func(n request.Notice) { notice = &n }
-				_, err := request.Ensure(context.Background(), e.opts)
+				_, err := ensure(t, context.Background(), e.opts)
 				var ep *request.ErrPending
 				if err == nil || errors.As(err, &ep) || notice != nil {
 					t.Fatalf("%s wait=%v: err = %v, notice = %v: the 201 must be refused", name, wait, err, notice)
@@ -535,7 +535,7 @@ func TestSecretsNeverLeak(t *testing.T) {
 		e := newEnv(t)
 		key := e.p.Key()
 		e.p.Script(keyclienttest.ApprovedWith(key, "agent", key))
-		res, err := request.Ensure(context.Background(), e.opts)
+		res, err := ensure(t, context.Background(), e.opts)
 		if err != nil || res.Token != key {
 			t.Fatalf("res=%+v err=%v", res, err)
 		}
@@ -548,7 +548,7 @@ func TestSecretsNeverLeak(t *testing.T) {
 		for _, sc := range []string{"denied", "expired", "unauthorized", "lost-reply"} {
 			e := newEnv(t)
 			e.p.Script(keyclienttest.Scenario(sc)...)
-			_, err := request.Ensure(context.Background(), e.opts)
+			_, err := ensure(t, context.Background(), e.opts)
 			if err == nil {
 				t.Errorf("%s: nil error", sc)
 			}
@@ -567,7 +567,7 @@ func TestApprovedNameAndRoleChecked(t *testing.T) {
 	} {
 		e := newEnv(t)
 		e.p.Script(keyclienttest.ApprovedWith(c.name, c.role, e.p.Key()))
-		res, err := request.Ensure(context.Background(), e.opts)
+		res, err := ensure(t, context.Background(), e.opts)
 		if err != nil || res != (request.Result{Token: e.p.Key(), Name: c.wantName, Role: c.wantRole}) {
 			t.Errorf("name %q role %q: res=%+v err=%v", c.name, c.role, res, err)
 		}
@@ -584,7 +584,7 @@ func TestReplyLimit(t *testing.T) {
 		e.p.FileWith(keyclienttest.Status(201, body[:len(body)-1]+","+pad+"}"))
 		notified := false
 		e.opts.Notify = func(request.Notice) { notified = true }
-		_, err := request.Ensure(context.Background(), e.opts)
+		_, err := ensure(t, context.Background(), e.opts)
 		if err == nil || !strings.Contains(err.Error(), "larger than") {
 			t.Errorf("err = %v", err)
 		}
@@ -599,7 +599,7 @@ func TestReplyLimit(t *testing.T) {
 		}))
 		defer srv.Close()
 		e.opts.ServiceURL = srv.URL
-		_, err := request.Ensure(context.Background(), e.opts)
+		_, err := ensure(t, context.Background(), e.opts)
 		if err == nil || !strings.Contains(err.Error(), "larger than") || len(e.p.Filed()) != 0 {
 			t.Errorf("err = %v, filed = %d", err, len(e.p.Filed()))
 		}
@@ -607,7 +607,7 @@ func TestReplyLimit(t *testing.T) {
 	t.Run("202 is read as unreadable: polling goes on", func(t *testing.T) {
 		e := newEnv(t)
 		e.p.Script(keyclienttest.Status(202, `{"status":"pending","interval":1,`+pad+`}`), keyclienttest.Approved())
-		res, err := request.Ensure(context.Background(), e.opts)
+		res, err := ensure(t, context.Background(), e.opts)
 		if err != nil || res.Token != e.p.Key() || len(e.p.Polls()) != 2 {
 			t.Errorf("res=%+v err=%v polls=%d", res, err, len(e.p.Polls()))
 		}
@@ -615,7 +615,7 @@ func TestReplyLimit(t *testing.T) {
 	t.Run("200 is read as unreadable: nothing stored, request kept", func(t *testing.T) {
 		e := newEnv(t)
 		e.p.Script(keyclienttest.Status(200, fmt.Sprintf(`{"status":"approved","name":"alice@laptop","role":"agent","key":%q,%s}`, e.p.Key(), pad)))
-		_, err := request.Ensure(context.Background(), e.opts)
+		_, err := ensure(t, context.Background(), e.opts)
 		if err == nil || !strings.Contains(err.Error(), "larger than") {
 			t.Errorf("err = %v", err)
 		}
@@ -636,7 +636,7 @@ func TestRequestTimeout(t *testing.T) {
 		defer srv.Close()
 		e.opts.ServiceURL = srv.URL
 		start := time.Now()
-		_, err := request.Ensure(context.Background(), e.opts)
+		_, err := ensure(t, context.Background(), e.opts)
 		if err == nil || errors.Is(err, request.ErrNoProvider) || time.Since(start) > 3*time.Second {
 			t.Errorf("err = %v after %v", err, time.Since(start))
 		}
@@ -645,7 +645,7 @@ func TestRequestTimeout(t *testing.T) {
 		e := newEnv(t)
 		e.p.FileWith(keyclienttest.Created().After(time.Minute))
 		start := time.Now()
-		_, err := request.Ensure(context.Background(), e.opts)
+		_, err := ensure(t, context.Background(), e.opts)
 		if err == nil || time.Since(start) > 3*time.Second || e.pendingExists() {
 			t.Errorf("err = %v after %v", err, time.Since(start))
 		}
@@ -654,7 +654,7 @@ func TestRequestTimeout(t *testing.T) {
 		e := newEnv(t)
 		e.p.Script(keyclienttest.Pending().After(time.Minute), keyclienttest.Approved())
 		start := time.Now()
-		res, err := request.Ensure(context.Background(), e.opts)
+		res, err := ensure(t, context.Background(), e.opts)
 		if err != nil || res.Token != e.p.Key() || time.Since(start) > 3*time.Second {
 			t.Errorf("res=%+v err=%v after %v", res, err, time.Since(start))
 		}
