@@ -160,8 +160,9 @@ type Source struct {
 	client *http.Client
 
 	// now and compare are replaced only by internal tests, before use.
-	now     func() time.Time
-	compare func(a, b []byte) int
+	now         func() time.Time
+	compare     func(a, b []byte) int
+	pullTimeout time.Duration // PullTimeout; internal tests shrink it
 
 	list atomic.Pointer[[]held] // the live list; never nil after New
 
@@ -212,7 +213,7 @@ func New(o Options) (*Source, error) {
 	if o.Refresh == 0 {
 		o.Refresh = DefaultRefresh
 	}
-	s := &Source{o: o, now: time.Now, compare: subtle.ConstantTimeCompare}
+	s := &Source{o: o, now: time.Now, compare: subtle.ConstantTimeCompare, pullTimeout: PullTimeout}
 	if o.TokenFile != "" {
 		if _, err := s.readToken(); err != nil {
 			return nil, err
@@ -518,7 +519,7 @@ var errUnauthorized = errors.New("provider answered 401")
 
 // pull does one request. The caller holds pullMu.
 func (s *Source) pull(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, PullTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.pullTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.o.URL, nil)

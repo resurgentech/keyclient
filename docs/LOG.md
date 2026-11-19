@@ -26,3 +26,18 @@ are appended, never edited in; a hook refuses rewrites.
 - `keyclienttest.NewProvider` and `keyclienttest.NewList` for tests here and in importing repos.
 - Standard library only; gate `just test`, `just vet`, `just lint`. Tag `v0.1.0`, local only.
 - Commits: 3e56f25, dd88694, fea3357, bebb27f, 5bf0c31, and the commit holding this entry.
+
+## 2026-11-19 — K1 fix round after the security review (before any publication)
+
+- Contract: tool transport (https except loopback unless allowed, never downgrade, discovery trusted as the
+  service), rules for `request_id`, `user_code`, `approve_url`, 24-hour client limit on `expires_in`, resume only
+  for the same service and request URL, a last poll at expiry; key list: 304 without `If-None-Match` and non-JSON
+  200 are failures, strict member names, cache never loaded over a pulled list, stale cache removed on a failed
+  write, untrusted cache refused, waiter bound and one trailing pull per throttled window, retry-once advice.
+- `request`: `Ensure` returns `Result` (token, granted name and role); `Options.AllowInsecureHTTP`; validated
+  provider text; sanitise-then-redact; `<token>.lock` flock and an in-process table (one flow per token); pending
+  file bound to its service and override and removed only by its own request; real `IsTerminal`.
+- `keylist`: `Accept` required, `AcceptRoles`, `Status`, `ErrCacheWrite`, `MaxMissWaiters`, trailing pull.
+- `internal/atomicfile`: never chmods a directory it did not create, nor through a symlink.
+- Tag `v0.1.0` moved to the new head (it had never been pushed).
+- Commits: dc58b30, 95f764f, 6fafe3b, ef6b0d3, and the commit holding this entry.

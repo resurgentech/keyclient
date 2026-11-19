@@ -119,7 +119,7 @@ func TestPendingFIFORefused(t *testing.T) {
 	}()
 	select {
 	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), request.PendingPath(e.token)) {
+		if err == nil || !strings.Contains(err.Error(), request.PendingPath(e.token)) || !strings.Contains(err.Error(), "must be a regular file") {
 			t.Errorf("err = %v", err)
 		}
 	case <-time.After(5 * time.Second):

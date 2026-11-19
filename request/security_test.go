@@ -351,7 +351,8 @@ func TestPendingNotARegularFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := request.Ensure(context.Background(), e.opts)
-	if err == nil || !strings.Contains(err.Error(), request.PendingPath(e.token)) {
+	// Refused by the regular-file rule itself, not by a later read error.
+	if err == nil || !strings.Contains(err.Error(), request.PendingPath(e.token)) || !strings.Contains(err.Error(), "must be a regular file") {
 		t.Errorf("a directory: err = %v", err)
 	}
 	if len(e.p.Filed()) != 0 {
