@@ -108,8 +108,10 @@ func (f *flight) finish(res Result, err error) {
 // join waits for the flight as a caller with this Wait. Wait true waits for its
 // end. Wait false waits for its notice, and gets the flow's result instead if
 // the flow has already ended (T-17), or ErrBusy if the owner waits for another
-// process with no notice to show. again is true when the flight ended by its
-// owner's context while ctx is still live: the caller starts over.
+// process with no notice to show. again is true when the flight ended for a
+// reason that is not this caller's (T-19): by its owner's context while ctx is
+// still live, or, for a Wait true caller, with ErrBusy (the background flow of
+// a Wait false call found its request gone); the caller starts over as owner.
 func (f *flight) join(ctx context.Context, wait bool) (res Result, err error, again bool) {
 	if !wait {
 		select {
@@ -144,6 +146,9 @@ func (f *flight) join(ctx context.Context, wait bool) (res Result, err error, ag
 		}
 	}
 	if (errors.Is(f.err, context.Canceled) || errors.Is(f.err, context.DeadlineExceeded)) && ctx.Err() == nil {
+		return Result{}, nil, true
+	}
+	if wait && errors.Is(f.err, ErrBusy) && ctx.Err() == nil {
 		return Result{}, nil, true
 	}
 	return f.res, f.err, false

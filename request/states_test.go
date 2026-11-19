@@ -205,6 +205,98 @@ func TestT16_WaitFalseMakesTheDuePoll(t *testing.T) {
 	})
 }
 
+// T-16: with Wait false and a due poll of a resumed request, the poll comes
+// first and Notify only after it, if the request is still open: a run that
+// collects the key (or ends it otherwise) shows no notice; one that leaves it
+// pending shows exactly one, after the poll.
+func TestT16_DuePollBeforeNotice(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		outcome keyclienttest.Outcome
+		notices int
+	}{
+		{"approved", keyclienttest.Approved(), 0},
+		{"denied", keyclienttest.Denied(), 0},
+		{"pending", keyclienttest.Pending(), 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := newEnv(t)
+			fileAndStop(t, e)
+			time.Sleep(2 * unit) // the next poll is due
+			e.p.Script(c.outcome)
+			var notices atomic.Int32
+			var pollsAtNotice atomic.Int32
+			e.opts.Notify = func(request.Notice) {
+				notices.Add(1)
+				pollsAtNotice.Store(int32(len(e.p.Polls())))
+			}
+			e.opts.Wait = false
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			res, err := ensure(t, ctx, e.opts)
+			if n := int(notices.Load()); n != c.notices {
+				t.Errorf("notices = %d, want %d", n, c.notices)
+			}
+			switch c.name {
+			case "approved":
+				if err != nil || res.Token != e.p.Key() {
+					t.Errorf("res=%+v err=%v, want the key", res, err)
+				}
+			case "denied":
+				if !errors.Is(err, request.ErrDenied) {
+					t.Errorf("err = %v, want ErrDenied", err)
+				}
+			case "pending":
+				var ep *request.ErrPending
+				if !errors.As(err, &ep) {
+					t.Fatalf("err = %v, want *ErrPending", err)
+				}
+				if p := pollsAtNotice.Load(); p != 1 {
+					t.Errorf("Notify ran after %d polls, want after the one due poll", p)
+				}
+				cancel()
+				waitDone(t, ep)
+				if n := notices.Load(); n != 1 {
+					t.Errorf("notices after the flow = %d, want 1", n)
+				}
+			}
+		})
+	}
+}
+
+// T-14 with T-16: a Notify that panics after the due poll (the request still
+// open) reaches the caller; the lock is released and P kept, so the next run
+// resumes.
+func TestT14_NotifyPanicAfterDuePoll(t *testing.T) {
+	e := newEnv(t)
+	fileAndStop(t, e)
+	time.Sleep(2 * unit)
+	e.p.Script(keyclienttest.Pending())
+	o := e.opts
+	o.Wait = false
+	o.Notify = func(request.Notice) { panic("boom in Notify") }
+	func() {
+		defer func() {
+			if r := recover(); r != "boom in Notify" {
+				t.Errorf("recovered %v, want the Notify panic", r)
+			}
+		}()
+		request.Ensure(context.Background(), o)
+	}()
+	if n := len(e.p.Polls()); n != 1 {
+		t.Errorf("polls = %d, want the one due poll", n)
+	}
+	if !e.pendingExists() {
+		t.Fatal("P was removed")
+	}
+	e.p.Script(keyclienttest.Approved())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if res, err := ensure(t, ctx, e.opts); err != nil || res.Token != e.p.Key() {
+		t.Errorf("after the panic: res=%+v err=%v", res, err)
+	}
+}
+
 // L-22: after each reply that keeps the loop going, the pending file records
 // the current interval and when the next poll is due.
 func TestL22_PendingRecordsPace(t *testing.T) {
@@ -320,6 +412,50 @@ func TestL2_ResumeUsesRecordedNext(t *testing.T) {
 			}
 		})
 	}
+}
+
+// L-2, T-I10: a next_poll_at more than one interval ahead (the clock was set
+// back) is cut to one interval from now and written back to P, so repeated
+// short Wait false runs poll once it is due and, the request approved, collect
+// the key; without the write-back each run would cut it again and never poll.
+func TestL2_CorrectedNextIsWrittenBack(t *testing.T) {
+	e := newEnv(t)
+	e.p.SetInterval(2)
+	fileAndStop(t, e)
+	m := readPendingMap(t, e)
+	m["next_poll_at"] = time.Now().Add(1000 * time.Hour).Format(time.RFC3339Nano)
+	b, _ := json.Marshal(m)
+	writePending(t, e, 0o600, string(b))
+	e.p.Script(keyclienttest.Approved())
+	e.opts.Wait = false
+	for run := 1; run <= 5; run++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		res, err := ensure(t, ctx, e.opts)
+		cancel() // the process exits
+		var ep *request.ErrPending
+		if errors.As(err, &ep) {
+			waitDone(t, ep)
+		} else if err != nil {
+			t.Fatalf("run %d: err = %v", run, err)
+		} else {
+			if res.Token != e.p.Key() {
+				t.Fatalf("run %d: token %q", run, res.Token)
+			}
+			if n := len(e.p.Polls()); n != 1 {
+				t.Errorf("polls = %d, want 1", n)
+			}
+			return
+		}
+		if run == 1 {
+			m = readPendingMap(t, e)
+			next, err := time.Parse(time.RFC3339Nano, fmt.Sprint(m["next_poll_at"]))
+			if err != nil || next.After(time.Now().Add(3*unit)) {
+				t.Errorf("after run 1: next_poll_at = %v (%v), want the corrected time, about one interval from the run", m["next_poll_at"], err)
+			}
+		}
+		time.Sleep(3 * unit) // more than the interval of 2
+	}
+	t.Fatalf("five Wait=false runs over more than seven intervals, approved all along: no key (polls %d)", len(e.p.Polls()))
 }
 
 // T-7: a service without a provider leaves nothing on disk: no directory, no
@@ -475,14 +611,38 @@ func TestNoticeService(t *testing.T) {
 	if ep != nil {
 		waitDone(t, ep)
 	}
+}
 
-	e = newEnv(t)
+// Notice.Service is the ServiceURL's host when a ServiceURL is set, even with
+// an Override (whose host is the provider's); the Override's host only when
+// there is no ServiceURL. A resumed notice gives the same.
+func TestNoticeServicePrefersServiceURL(t *testing.T) {
+	e := newEnv(t)
 	e.opts.ServiceURL = "https://service.example:8443"
 	e.opts.Override = e.p.RequestURL()
-	u, _ = url.Parse(e.p.URL())
-	n = fileAndStop(t, e)
-	if n.Service != u.Host {
-		t.Errorf("with Override: Service = %q, want the Override's host %q", n.Service, u.Host)
+	n := fileAndStop(t, e)
+	if n.Service != "service.example:8443" {
+		t.Errorf("both set: Service = %q, want the ServiceURL's host service.example:8443", n.Service)
+	}
+	e.p.SetInterval(50)
+	e.opts.Wait = false
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err := ensure(t, ctx, e.opts)
+	cancel()
+	var ep *request.ErrPending
+	if !errors.As(err, &ep) || !ep.Notice.Resumed || ep.Notice.Service != "service.example:8443" {
+		t.Errorf("both set, resumed: err = %v", err)
+	}
+	if ep != nil {
+		waitDone(t, ep)
+	}
+
+	e = newEnv(t)
+	e.opts.ServiceURL = ""
+	e.opts.Override = e.p.RequestURL()
+	u, _ := url.Parse(e.p.URL())
+	if n := fileAndStop(t, e); n.Service != u.Host {
+		t.Errorf("Override only: Service = %q, want the Override's host %q", n.Service, u.Host)
 	}
 }
 

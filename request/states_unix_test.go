@@ -134,6 +134,93 @@ func TestT22_BackgroundFindsTheToken(t *testing.T) {
 	}
 }
 
+// T-19 with T-22: a Wait true caller that joined the background flow of a Wait
+// false call (waiting for another process's lock) does not get that flow's
+// ErrBusy, a reason that is not its own: it starts over as owner, files and
+// collects the key.
+func TestT19_WaitTrueJoinerOfBusyBackgroundStartsOver(t *testing.T) {
+	e := newEnv(t)
+	fileAndStop(t, e)
+	release := holdLock(t, e)
+	o := e.opts
+	o.Wait = false
+	_, err := ensure(t, context.Background(), o)
+	var ep *request.ErrPending
+	if !errors.As(err, &ep) {
+		release()
+		t.Fatalf("err = %v, want *ErrPending", err)
+	}
+	type out struct {
+		res request.Result
+		err error
+	}
+	joined := make(chan out, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		res, err := ensure(t, ctx, e.opts) // Wait true: joins the background flow
+		joined <- out{res, err}
+	}()
+	time.Sleep(200 * time.Millisecond)
+	// The other process settles the request: P is gone when the lock is free,
+	// so the background flow ends with ErrBusy.
+	if err := os.Remove(request.PendingPath(e.token)); err != nil {
+		t.Fatal(err)
+	}
+	e.p.Script(keyclienttest.Approved())
+	release()
+	waitDone(t, ep)
+	if !errors.Is(ep.Err(), request.ErrBusy) {
+		t.Errorf("background: Err = %v, want ErrBusy", ep.Err())
+	}
+	select {
+	case got := <-joined:
+		if got.err != nil || got.res.Token != e.p.Key() {
+			t.Errorf("Wait true joiner: res=%+v err=%v, want it to start over and collect the key", got.res, got.err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the Wait true joiner hung")
+	}
+	if n := len(e.p.Filed()); n != 2 {
+		t.Errorf("filed %d, want 2 (the first run, then the joiner as owner)", n)
+	}
+}
+
+// T-22: the background goroutine resumes only the request it reported. If,
+// when the lock is free, P holds another current request, it ends with ErrBusy
+// and neither polls nor shows that other request.
+func TestT22_BackgroundResumesOnlyTheReportedRequest(t *testing.T) {
+	e := newEnv(t)
+	first := fileAndStop(t, e)
+	release := holdLock(t, e)
+	var notices atomic.Int32
+	e.opts.Notify = func(request.Notice) { notices.Add(1) }
+	e.opts.Wait = false
+	_, err := ensure(t, context.Background(), e.opts)
+	var ep *request.ErrPending
+	if !errors.As(err, &ep) || ep.Notice.UserCode != first.UserCode {
+		release()
+		t.Fatalf("err = %v, want the *ErrPending of the first request", err)
+	}
+	// The other process settles that request and files another one.
+	writePending(t, e, 0o600, pendingJSON(e, time.Now().Add(time.Hour), e.p.URL()+"/v1/requests/old/poll",
+		func(m map[string]any) { m["user_code"] = "CCCC-DDDD" }))
+	release()
+	waitDone(t, ep)
+	if !errors.Is(ep.Err(), request.ErrBusy) {
+		t.Errorf("background: Err = %v, want ErrBusy", ep.Err())
+	}
+	if n := len(e.p.Polls()); n != 0 {
+		t.Errorf("the background polled %d times: it resumed a request it did not report", n)
+	}
+	if notices.Load() != 1 {
+		t.Errorf("notices = %d, want 1", notices.Load())
+	}
+	if !e.pendingExists() {
+		t.Error("the other request's P was removed")
+	}
+}
+
 // T-22, T-I9: with another process holding the lock and no current P, a Wait
 // false call returns ErrBusy at once; nothing is filed or shown.
 func TestT22_WaitFalseBehindLockWithoutPendingIsBusy(t *testing.T) {
@@ -283,7 +370,7 @@ func TestT28_LockFileRefused(t *testing.T) {
 			os.Chmod(e.token+".lock", 0o602)
 		},
 		"not owned": func(t *testing.T, e *env) {
-			t.Cleanup(request.SetGetuid(func() int { return os.Getuid() + 1 }))
+			t.Cleanup(request.SetGeteuid(func() int { return os.Geteuid() + 1 }))
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

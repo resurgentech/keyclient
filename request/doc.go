@@ -25,7 +25,10 @@
 //     A tool that prints the notice and exits still collects its key: the
 //     pending file records when the next poll is due, and a later call makes
 //     that poll before it returns once it is due, returning the key if the
-//     request was approved. A call with Wait false never waits for a person
+//     request was approved. That poll comes before Notify: a call that
+//     collects the key, or finds the request denied, expired or consumed,
+//     shows no notice; one that finds it still open shows it once, after the
+//     poll. A call with Wait false never waits for a person
 //     or for another process; only the time limits of its network calls
 //     bound it.
 //
@@ -100,8 +103,8 @@
 //     created with mode 0700 when it does not exist.
 //   - TokenPath + ".lock": an empty file, mode 0600, the lock. It is left in
 //     place. A lock file that is a link, not a regular file, not owned by the
-//     user, or writable by group or others is refused with an error that
-//     names it.
+//     process's effective user, or writable by group or others is refused
+//     with an error that names it.
 //   - TokenPath + ".pending" ([PendingPath]): mode 0600, while a request is open.
 //     It holds the request id, poll URL, poll secret, approve URL, user code,
 //     role, tool, the current interval and when the next poll is due
@@ -110,20 +113,24 @@
 //     later run resumes the request, at the same pace, instead of filing a
 //     second one. A later run with another ServiceURL or Override drops it and
 //     files anew. Its values are checked again when it is resumed; a file that
-//     is not a regular file of mode 0600 owned by the user, or whose values
-//     break the rules, is refused. A next poll time in the past (or none, in a
-//     file of an older version) means now; one further away than the interval
-//     means one interval from now. It is removed once the request settles (key
-//     stored, denied, expired, consumed) or expires, and only while it still
-//     holds that request. It is kept when the tool stops without a verdict
-//     (context ended, 401, an unexpected status). Only the lock holder writes
-//     or removes it.
+//     is not a regular file of mode 0600 owned by the process's effective
+//     user, or whose values break the rules, is refused. A next poll time in
+//     the past (or none, in a file of an older version) means now; one further
+//     away than the interval (a clock set back) means one interval from now,
+//     and that time is written back to the file. It is removed once the
+//     request settles (key stored, denied, expired, consumed) or expires, and
+//     only while it still holds that request. It is kept when the tool stops
+//     without a verdict (context ended, 401, an unexpected status). Only the
+//     lock holder writes or removes it.
 //
 // Limits: each HTTP call is bounded by [RequestTimeout], and at most
 // [MaxReply] bytes of a reply are read. The request is treated as expired at
 // most 24 hours after it was filed (or, when resumed, from now), whatever
 // expires_in says. When the next poll would fall after the expiry, the tool
-// polls once more at the expiry.
+// polls once more at the expiry. A 429 (slow down) whose interval is readable
+// and at least the current one sets the interval to it (at the provider's cap
+// it stays the same); a smaller or unreadable one adds 2 to the current
+// interval.
 //
 // The poll secret and the key are written to the pending and token files and
 // nowhere else: no error, [Notice] or [ErrPending] text ever contains either.

@@ -23,7 +23,9 @@ import (
 // documentation, docs/CONTRACT.md and docs/STATES.md.
 //
 // With Wait false the returned error is an *[ErrPending] right after filing or
-// resuming (or the result of the one poll that was already due); the poll then
+// resuming, or the result of the one poll of a resumed request that was
+// already due: that poll is made before Notify, which is then called only if
+// the request is still open. The poll then
 // runs in a goroutine, holding the lock, until it ends or ctx ends, so ctx
 // must outlive the call. With Wait true, waiting for the lock that another
 // process holds is bounded by ctx; with Wait false it never delays the return.
@@ -201,6 +203,16 @@ func (fl *flow) locked(ctx context.Context, lk *fileLock, background bool) (res 
 	if err != nil {
 		return Result{}, err, false
 	}
+	// T-16: with Wait false, a poll of a resumed request that is already due is
+	// made before returning, and before Notify: if it settles the request, its
+	// result is returned and no notice is shown. (A request filed by this call
+	// is not polled here: Wait false then always returns *ErrPending after
+	// filing.)
+	if !fl.o.Wait && !background && n.Resumed && s.due() {
+		if res, err, done := s.step(ctx); done {
+			return res, err, false
+		}
+	}
 	ep := fl.f.pendingErr()
 	if s.requestID != fl.shown {
 		ep = fl.f.pending(n)
@@ -209,14 +221,6 @@ func (fl *flow) locked(ctx context.Context, lk *fileLock, background bool) (res 
 	if fl.o.Wait || background {
 		res, err := s.run(ctx)
 		return res, err, false
-	}
-	// T-16: a poll of a resumed request that is already due is made before
-	// returning. (A request filed by this call is not polled here, however long
-	// Notify took: Wait false then always returns *ErrPending after filing.)
-	if n.Resumed && s.due() {
-		if res, err, done := s.step(ctx); done {
-			return res, err, false
-		}
 	}
 	go func() {
 		res, err := s.run(ctx)
@@ -264,10 +268,13 @@ func (fl *flow) start(ctx context.Context, background bool) (*session, Notice, e
 		return nil, Notice{}, ErrBusy
 	}
 	s := &session{client: fl.client, tokenPath: fl.tokenPath, pendPath: fl.pendPath, unit: fl.unit}
+	cut := false
 	if resumed {
 		// L-2: the interval and next poll P recorded. A next in the past (or
 		// absent: an older file) means now; one further away than an interval
-		// is cut to an interval from now.
+		// (the clock was set back) is cut to an interval from now, and that is
+		// written back below, so that a run too short to reach it does not
+		// leave the next run to cut it again (T-I10).
 		s.interval = pf.Interval
 		t := now()
 		next := pf.NextPollAt
@@ -275,7 +282,7 @@ func (fl *flow) start(ctx context.Context, background bool) (*session, Notice, e
 			next = t
 		}
 		if limit := t.Add(s.wait()); next.After(limit) {
-			next = limit
+			next, cut = limit, true
 		}
 		s.nextAt = next
 	} else {
@@ -307,6 +314,9 @@ func (fl *flow) start(ctx context.Context, background bool) (*session, Notice, e
 	}
 	s.pf = pf
 	s.requestID, s.pollURL, s.secret, s.expiresAt = pf.RequestID, pf.PollURL, pf.PollSecret, pf.ExpiresAt
+	if cut {
+		s.save() // as the lock holder, and only while P still holds this request
+	}
 	return s, noticeOf(pf, resumed), nil
 }
 
@@ -318,12 +328,12 @@ func noticeOf(pf pendingFile, resumed bool) Notice {
 	}
 }
 
-// serviceHost is the host (and port) of the Override when it is set, else of
-// the ServiceURL, made safe to show.
+// serviceHost is the host (and port) of the ServiceURL when it is set, else of
+// the Override, made safe to show.
 func serviceHost(serviceURL, override string) string {
-	raw := override
+	raw := serviceURL
 	if raw == "" {
-		raw = serviceURL
+		raw = override
 	}
 	u, err := url.Parse(raw)
 	if err != nil {

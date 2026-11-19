@@ -64,8 +64,9 @@ var errUnsupported = fmt.Errorf("key request: key requests are not supported on 
 // hostname is the source of the default Host; tests replace it.
 var hostname = os.Hostname
 
-// getuid is the user that must own the lock and pending files; tests replace it.
-var getuid = os.Getuid
+// geteuid is the user that must own the lock and pending files: the effective
+// user, the one whose rights open and create them (T-28); tests replace it.
+var geteuid = os.Geteuid
 
 // second is the unit of intervals and of expires_in; tests shrink it.
 var second = time.Second
@@ -145,7 +146,11 @@ type Options struct {
 	// followed: a 3xx is "any other status".
 	HTTPClient *http.Client
 	// Notify is called once per Ensure that files or resumes a request, before
-	// polling, in the caller's goroutine. It is also called, with a notice
+	// polling, in the caller's goroutine; except that with Wait false, when a
+	// poll of a resumed request is already due, that poll comes first and
+	// Notify is called after it only if the request is still open (a call that
+	// collects the key, or finds the request ended, shows no notice). It is
+	// also called, with a notice
 	// marked resumed, when another process holds the lock and the pending file
 	// holds its request: then before waiting for that lock (Wait true) or
 	// before returning *ErrPending (Wait false); a request shown this way is
@@ -178,8 +183,9 @@ type Options struct {
 	// Wait true polls until the request settles. False returns *ErrPending
 	// once the request is filed or resumed, and polls in the background,
 	// holding the lock until that poll ends; when a poll of a resumed request
-	// is already due, that one poll is made first, and if it settles the
-	// request its result is returned instead. A call with Wait false never
+	// is already due, that one poll is made first (before Notify), and if it
+	// settles the request its result is returned instead, with no notice. A
+	// call with Wait false never
 	// waits for a person or for another process: only the time limits of its
 	// network calls bound it.
 	Wait bool
@@ -210,9 +216,11 @@ type Result struct {
 // a URL opener without the user's consent.
 type Notice struct {
 	// Service is the host (and port, if any) of the service the key is for:
-	// the host of ServiceURL, or of Override when Override is used. It comes
-	// from the configuration, not from the provider; a resumed notice takes it
-	// from the pending file, which records both.
+	// the host of ServiceURL when ServiceURL is set (with or without an
+	// Override), and the host of Override only when there is no ServiceURL
+	// (then it is the provider's host). It comes from the configuration, not
+	// from the provider; a resumed notice takes it from the pending file,
+	// which records both.
 	Service    string
 	ApproveURL string
 	UserCode   string

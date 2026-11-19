@@ -124,10 +124,11 @@ func (l *fileLock) release() {
 	l.f.Close()
 }
 
-// ownedByMe reports whether fi is owned by this process's user.
+// ownedByMe reports whether fi is owned by this process's effective user, the
+// owner of the files it creates.
 func ownedByMe(fi fs.FileInfo) bool {
 	st, ok := fi.Sys().(*syscall.Stat_t)
-	return ok && uint64(st.Uid) == uint64(getuid())
+	return ok && uint64(st.Uid) == uint64(geteuid())
 }
 
 // mkdirPrivate creates dir and any missing parents with mode 0700, as the

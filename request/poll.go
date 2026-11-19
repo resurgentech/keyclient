@@ -125,7 +125,10 @@ func (s *session) step(ctx context.Context) (res Result, err error, done bool) {
 				s.interval = min(b.Interval, maxSeconds)
 			}
 		case status == http.StatusTooManyRequests:
-			if readable && b.Interval > s.interval {
+			// L-7: a readable interval at least the current one is used as
+			// given (at the provider's cap it is unchanged); an unreadable or
+			// smaller one gives the current interval + 2.
+			if readable && b.Interval >= s.interval {
 				s.interval = min(b.Interval, maxSeconds)
 			} else {
 				s.interval = min(s.interval+2, maxSeconds)

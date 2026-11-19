@@ -17,12 +17,12 @@ func SetHostname(f func() (string, error)) (restore func()) {
 	return func() { hostname = old }
 }
 
-// SetGetuid replaces os.Getuid, against which the owner of the lock and
-// pending files is checked.
-func SetGetuid(f func() int) (restore func()) {
-	old := getuid
-	getuid = f
-	return func() { getuid = old }
+// SetGeteuid replaces os.Geteuid, the effective user against which the owner
+// of the lock and pending files is checked.
+func SetGeteuid(f func() int) (restore func()) {
+	old := geteuid
+	geteuid = f
+	return func() { geteuid = old }
 }
 
 // SetRequestTimeout changes the bound of each HTTP call (RequestTimeout), so
