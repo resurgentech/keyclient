@@ -12,10 +12,11 @@ import (
 // cacheWritableByOthers reports whether group or others can write the cache.
 func cacheWritableByOthers(m fs.FileMode) bool { return m&0o022 != 0 }
 
-// cacheForeignOwner reports whether another user owns the cache file.
+// cacheForeignOwner reports whether a user other than the effective one owns
+// the cache file.
 func cacheForeignOwner(fi fs.FileInfo) bool {
 	st, ok := fi.Sys().(*syscall.Stat_t)
-	return ok && int(st.Uid) != os.Getuid()
+	return ok && int(st.Uid) != geteuid()
 }
 
 // emptyFile truncates the regular file at path without following a symlink at
@@ -36,3 +37,6 @@ func emptyFile(path string) error {
 	}
 	return f.Truncate(0)
 }
+
+// geteuid is the effective uid; tests replace it.
+var geteuid = os.Geteuid

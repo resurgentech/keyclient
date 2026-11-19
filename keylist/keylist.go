@@ -214,11 +214,14 @@ type Source struct {
 
 	list atomic.Pointer[[]held] // the live list; never nil after New
 
-	pullMu  sync.Mutex // serialises pulls; guards the next three
+	pullMu  sync.Mutex // serialises pulls; guards the fields below up to statusMu
 	etag    string     // ETag of a 200 in this process
 	failing bool       // the current streak of failures has been logged
 	lastErr string     // text of the last logged failure
 	applied bool       // a 200 has been applied in this process
+
+	cacheStreak bool // cache writes are failing and that has been logged (guarded by pullMu)
+	staleLogged bool // in this streak, the older cache could be neither removed nor emptied, logged (pullMu)
 
 	statusMu     sync.Mutex // guards the next five
 	lastSuccess  time.Time
@@ -714,7 +717,13 @@ func (s *Source) pull(ctx context.Context) error {
 		// The cache must never hold a list older than the one now live: take
 		// the old one away, or if that fails empty it.
 		s.dropCache()
-		s.log.Error("key list cache not written, the list is applied anyway", "error", werr.Error())
+		if !s.cacheStreak { // the first failure of a streak, not every refresh
+			s.cacheStreak = true
+			s.log.Error("key list cache not written, the list is applied anyway", "error", werr.Error())
+		}
+	} else if s.cacheStreak {
+		s.cacheStreak, s.staleLogged = false, false
+		s.log.Info("key list cache written again")
 	}
 	s.swap(live)
 	s.applied = true
@@ -744,7 +753,8 @@ func (s *Source) dropCache() {
 		return
 	}
 	// Never through a symlink, and only a regular file (K-6, K-7).
-	if err := emptyFile(s.o.CacheFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := emptyFile(s.o.CacheFile); err != nil && !errors.Is(err, os.ErrNotExist) && !s.staleLogged {
+		s.staleLogged = true // K4: an error on its first occurrence in a streak
 		s.log.Error("key list stale cache cannot be removed or emptied, a restart may load an older list", "error", err.Error())
 	}
 }
