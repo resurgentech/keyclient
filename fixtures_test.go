@@ -126,6 +126,38 @@ func TestFixturesRoundTripKey(t *testing.T) {
 	}
 }
 
+// The 201 fixture follows the field rules a tool enforces (docs/CONTRACT.md,
+// "Filing a request").
+func TestCreatedFixtureFollowsFieldRules(t *testing.T) {
+	var c struct {
+		RequestID  string `json:"request_id"`
+		PollSecret string `json:"poll_secret"`
+		ApproveURL string `json:"approve_url"`
+		UserCode   string `json:"user_code"`
+		ExpiresIn  int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(readExample(t, keyclient.Fixtures(), "keyrequest/created.json").Value, &c); err != nil {
+		t.Fatal(err)
+	}
+	if !regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`).MatchString(c.RequestID) {
+		t.Errorf("request_id %q breaks its rule", c.RequestID)
+	}
+	if !regexp.MustCompile(`^[A-Za-z0-9-]{1,32}$`).MatchString(c.UserCode) {
+		t.Errorf("user_code %q breaks its rule", c.UserCode)
+	}
+	if !regexp.MustCompile(`^https://[!-~]+$`).MatchString(c.ApproveURL) || len(c.ApproveURL) > 2048 || strings.Contains(c.ApproveURL, "@") {
+		t.Errorf("approve_url %q breaks its rule", c.ApproveURL)
+	}
+	for _, v := range []string{c.RequestID, c.ApproveURL, c.UserCode} {
+		if strings.Contains(v, c.PollSecret) {
+			t.Errorf("%q contains the poll secret", v)
+		}
+	}
+	if c.ExpiresIn > 86400 {
+		t.Errorf("expires_in %d is over the client limit", c.ExpiresIn)
+	}
+}
+
 // The spec references every fixture that has a body, and every reference
 // resolves.
 func TestSpecReferencesFixtures(t *testing.T) {
