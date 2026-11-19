@@ -54,8 +54,9 @@ default:                                    // denied, expired, refused URL, pro
   prints it and exits 2. The next run resumes the same request from the pending file instead of filing another,
   provided it uses the same `ServiceURL` and `Override`; otherwise the old request is dropped and a new one filed.
   The pending file keeps the pace (the current interval and when the next poll is due), and a resumed `Wait: false`
-  call makes the poll that is due before it returns, so a tool that only ever prints and exits still collects its
-  key: the run after approval returns it.
+  call makes the poll that is due before it shows anything: if that poll collects the key, `Ensure` returns it with
+  no notice; otherwise it shows the notice once and returns `*ErrPending`. So a tool that only ever prints and exits
+  still collects its key: the run after approval returns it.
 - **A long-running server** (an MCP server, say) uses `Wait: false` and keeps the `*ErrPending`: it answers each
   call with the notice until `Ready()` reports the key stored, then reads the token as usual. If `Done()` closes
   without the key (`Err()` says why), the next `Ensure` files a new request.
@@ -72,7 +73,8 @@ default:                                    // denied, expired, refused URL, pro
 - Key requests are supported on Linux, macOS and the BSDs; elsewhere `Ensure` still returns a token already on
   disk and otherwise returns an error that matches `errors.Is(err, errors.ErrUnsupported)`. A file system without
   `flock` fails closed.
-- The notice names the service (`Notice.Service`). Show it to the user; never pass `Notice.ApproveURL` (or the
+- The notice names the service (`Notice.Service`: the host of `ServiceURL` when one is set, else the host of the
+  override). Show it to the user; never pass `Notice.ApproveURL` (or the
   notice) to a shell, and open it in a browser only with the user's consent.
 
 **Transport.** Plain `http` is refused for the service, the request URL, the poll URL and the approval URL unless
@@ -87,8 +89,8 @@ genuine approval page and a matching code. Reaching the service over `https` is 
 |---|---|---|
 | `TokenPath` | 0600 | Written atomically (temporary file, rename) when the key arrives. |
 | its directory | 0700 | Only when `Ensure` creates it; an existing directory is left alone. |
-| `TokenPath + ".pending"` | 0600 | While a request is open: request id, poll URL, poll secret, approval URL, code, expiry, the current interval and when the next poll is due, and the service URL, override and request URL it was filed under. Removed once the request settles or expires (or, if left beside a token by a crash, by the next lock holder). One that is not a regular file, is not owned by the user, is readable by group or others, or breaks the field rules is refused. |
-| `TokenPath + ".lock"` | 0600 | Empty; holds the lock. Created when a request is needed (after discovery) and left in place. One that is a link, not a regular file, not owned by the user, or writable by group or others is refused. |
+| `TokenPath + ".pending"` | 0600 | While a request is open: request id, poll URL, poll secret, approval URL, code, expiry, the current interval and when the next poll is due, and the service URL, override and request URL it was filed under. Removed once the request settles or expires (or, if left beside a token by a crash, by the next lock holder). One that is not a regular file, is not owned by the effective user, is readable by group or others, or breaks the field rules is refused. |
+| `TokenPath + ".lock"` | 0600 | Empty; holds the lock. Created when a request is needed (after discovery) and left in place. One that is a link, not a regular file, not owned by the effective user, or writable by group or others is refused. |
 
 Temporary files that an interrupted write leaves beside the token or the pending file are removed by the next lock
 holder.
@@ -139,7 +141,7 @@ What `keylist` guarantees:
   pulled in this process. If a cache write fails, the list is still swapped in, `Pull` returns an error wrapping
   `keylist.ErrCacheWrite`, `Status().CacheFailing` is set, the `ETag` is dropped so the next pull rewrites the
   cache, and the older cache is removed or emptied (never through a link) so that a restart never brings back a
-  revoked key. A cache that is not a regular file, is not owned by the user, or that group or others can write, is
+  revoked key. A cache that is not a regular file, is not owned by the effective user, or that group or others can write, is
   refused; opening it never blocks. `Start` removes temporary files an interrupted write left.
 - `Status()` says where the live list came from and how old it is: for a list served from the cache, the age of
   the cache file, never zero.

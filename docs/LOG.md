@@ -60,3 +60,21 @@ are appended, never edited in; a hook refuses rewrites.
   `Options.AllowInsecureHTTP`; temporary files removed at `Start`.
 - Tag `v0.1.0` moved to the new head (never pushed).
 - Commits: d41a459, f8b43c2, ce45956, and the commit holding this entry.
+
+## 2026-11-19 — v0.1.1
+
+What changes for a user of the module (no exported API changed):
+
+- `Notice.Service` is now the host of `ServiceURL` when one is set; the override's host only when there is no
+  `ServiceURL` (it was the override's host whenever an override was set).
+- A resumed `Wait: false` call makes its due poll before it shows the notice: if that poll collects the key, the
+  key is returned and no "approve at" notice is printed; otherwise the notice is shown once, as before.
+- A `429` whose interval is not smaller than the current one is used as given (at the provider's cap it is
+  unchanged); only an unreadable or smaller one adds 2.
+- A next poll time cut after a clock was set back is written back to the pending file, so short runs keep polling.
+- A `Wait: true` caller that joined a background flow ending with `ErrBusy` starts over instead of returning it.
+- The background poll of a `Wait: false` call behind another process resumes only the request it reported.
+- Lock, pending and cache files must be owned by the effective user (was the real user).
+- A failing cache write is logged once per streak, and the recovery once.
+- Clean-up of interrupted writes removes exactly the temporary names `Write` makes for that path.
+- Commits: the v0.1.1 commits on top of 9ce1f10; tag `v0.1.1`.

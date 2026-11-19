@@ -269,7 +269,7 @@ the latest response that carried one.
 | Status | Body | Meaning | Tool action |
 |---|---|---|---|
 | `202` | `{"status":"pending","interval":N}` | No decision yet. | Poll again after `N` seconds. |
-| `429` | `{"status":"slow_down","interval":N}` | The tool polled too soon. | Use `N`, which is the old interval plus 2. |
+| `429` | `{"status":"slow_down","interval":N}` | The tool polled too soon. Sent only while the request is undecided. | Use `N`: the old interval plus 2, up to the cap; at the cap it is unchanged. |
 | `200` | `{"status":"approved","name":"...","role":"...","key":"..."}` | Approved. Sent exactly once. | Store the key. Stop. |
 | `403` | `{"status":"denied"}` | A person denied it. Final. | Stop and report. |
 | `410` | `{"status":"expired"}` or `{"status":"consumed"}` | Final. `expired`: the time ran out. `consumed`: the key was already handed out. | Stop and report. |
@@ -281,7 +281,8 @@ the latest response that carried one.
 since the previous poll was handled. It answers `429` with the old interval plus 2, and the new value is the
 request's interval from then on, in every later reply. A too-soon poll counts as a poll for timing. The interval
 never goes down. The interval never exceeds ten times the interval the `201` gave. The tool uses the new value for
-its next wait. A `429` with a body the tool cannot read is treated as `slow_down` with the interval plus 2.
+its next wait: a readable interval that is at least the current one is used as given. A `429` with a body the tool
+cannot read, or with a smaller interval, is treated as `slow_down` with the interval plus 2.
 
 **Approval and pacing.** Once a request is approved, the provider delivers the key on the next poll that carries
 the right poll secret and arrives before the request expires, whether or not that poll is early. Pacing applies only

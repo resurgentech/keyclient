@@ -98,7 +98,7 @@ Everything a tool keeps for one token path, across all its processes.
 | Variable | Values |
 |---|---|
 | Token file **T** | *absent* (missing or empty) or *present*. |
-| Pending file **P** (`token + ".pending"`) | *absent*; *current* (a regular file of mode 0600 whose values pass the rules, filed for this run's service URL and override, not expired); *foreign* (valid, but for another service URL or override); *expired*; *unusable* (wrong type or mode, not owned by the user, or values that break the rules). |
+| Pending file **P** (`token + ".pending"`) | *absent*; *current* (a regular file of mode 0600 whose values pass the rules, filed for this run's service URL and override, not expired); *foreign* (valid, but for another service URL or override); *expired*; *unusable* (wrong type or mode, not owned by the effective user, or values that break the rules). |
 | Lock **L** (`flock` on `token + ".lock"`) | *free*, *mine* (this process holds it) or *other's*. The lock file itself stays on disk once made. |
 | Flow entry **F** (in memory, one per token path per process) | *none*; *starting* (no notice yet); *noticed* (a notice exists). |
 
@@ -148,31 +148,31 @@ it.
 | T-8 | T2, P absent | discovery fails; filing is refused; the `201` breaks a rule | T0 | Error. Nothing shown, nothing stored. A `201` that was refused leaves an open request at the provider that nobody polls; it expires there. |
 | T-9 | T2, P absent | `201` accepted, P cannot be written | T0 | Error. The same orphan as T-8. |
 | T-10 | T2, P absent | `201` accepted, P written | T3 | `Notify` once. P records the request, the service URL, the override, the current interval and when the next poll is due. |
-| T-11 | T2, P current | | T3 | Resumed: no discovery, no filing. `Notify` once, marked resumed. |
+| T-11 | T2, P current | | T3 | Resumed: no discovery, no filing. `Notify` once, marked resumed (with `Wait` false, after the due poll of T-16, and not at all if that poll settles the request). |
 | T-12 | T2, P expired or foreign | | T2 | P removed; continue as P absent (with the request URL found by an early discovery, if one ran). A foreign P leaves an orphan at its provider. |
 | T-13 | T2, P unusable | | T6 | Error that names the file. Nothing filed, nothing removed. |
 | T-14 | T2, T3, T5 | `Notify` panics | T4 | The panic reaches the owner's caller. The flow ends with an error for every joined caller. Lock released. P kept. |
 | T-15 | T3, `Wait` true | the poll loop ends | by L-rows | The loop's result is returned. Then the lock is released and the flow entry removed. |
-| T-16 | T3, `Wait` false | | T3 | `Ensure` returns `*ErrPending` with the notice. The loop goes on in the background **and keeps the lock** until it ends. If the request was resumed and a poll is already due, that one poll is made before returning (after `Notify`), so a tool that prints the notice and exits collects the key on a later run; if that poll settles the request, its result is returned instead (T1 or T0). A request just filed is never polled before returning. |
+| T-16 | T3, `Wait` false | | T3 | `Ensure` returns `*ErrPending` with the notice. The loop goes on in the background **and keeps the lock** until it ends. If the request was resumed and a poll is already due, that one poll is made before returning, and before `Notify`: if that poll settles the request, its result is returned (T1 or T0) and no notice is shown; otherwise `Notify` is called once and `*ErrPending` returned. So a tool that prints the notice and exits collects the key on a later run without printing "approve at" first. A request just filed is never polled before returning. |
 | T-17 | T3 | another goroutine calls `Ensure`, `Wait` false | T3 | It gets the same `*ErrPending`, or the flow's result if the flow has already ended. No second notice, filing or poller. |
 | T-18 | T2 | another goroutine calls `Ensure`, `Wait` false | T2 | It waits until the notice exists or the flow ends, or its own context ends. If the owner is waiting for another process's lock with no notice to show (T5), it gets `ErrBusy` at once. |
-| T-19 | T2, T3 | another goroutine calls `Ensure`, `Wait` true | same | It waits for the flow's end and gets its result. If the flow ended only because its owner's context ended, and this caller's has not, it starts over as owner (T-4). |
+| T-19 | T2, T3 | another goroutine calls `Ensure`, `Wait` true | same | It waits for the flow's end and gets its result. If the flow ended for a reason that is not this caller's own (its owner's context ended while this caller's has not, or a T-22 background flow ended with `ErrBusy`), it starts over as owner (T-4). |
 | T-20 | T2, T3 | a joined caller's context ends | same | That caller gets its context's error. The flow is not affected. |
 | T-21 | T2, T3 in another process | `Ensure`, `Wait` true | T5 | Waits for the lock, up to its context. Shows the notice read from P once, marked resumed, so the wait is not silent. When the lock is free: T-6 or T-11, without a second notice for the same request. |
-| T-22 | T2, T3 in another process | `Ensure`, `Wait` false | T5 | P current: `Notify` once (resumed) and return at once an `*ErrPending` built from P; a background goroutine waits for the lock and then follows T-6 or T-11, or ends with `ErrBusy` if P no longer holds that request. P absent, foreign, expired or unusable: `ErrBusy` at once; nothing filed or shown. |
+| T-22 | T2, T3 in another process | `Ensure`, `Wait` false | T5 | P current: `Notify` once (resumed) and return at once an `*ErrPending` built from P; a background goroutine waits for the lock and then follows T-6, or T-11 for that same request only, or ends with `ErrBusy` if P no longer holds that request (a different current request is not resumed). P absent, foreign, expired or unusable: `ErrBusy` at once; nothing filed or shown. |
 | T-23 | T5 | this caller's context ends | as before | Error that wraps the context's. Nothing touched. |
 | T-24 | T3 | the owner's context ends | T4 | P kept. Lock released. The flow ends with the context's error; an `*ErrPending` reports it through `Err`. |
 | T-25 | T2, T3 | the process is killed | T4, or T0 | The kernel frees the lock. Files stay as they were: each write is whole or absent. Killed after the `201` and before P was written: T0 and an orphan. A temporary file may remain; the next lock holder removes those of this token. |
 | T-26 | T3 | something else writes T | T3 | Nothing yet. At approval or at `410 consumed` the existing token is kept and returned; P is removed (L-9, L-14). |
 | T-27 | T1 with P present | `Ensure` | T1 | As T-1. P is a leftover of a crash between storing the key and removing P; the next lock holder removes it. |
-| T-28 | T absent | the lock path is a link, not a regular file, not owned by the user, writable by group or others, cannot be opened, or the file system has no locks | same | Error that names the lock file. Nothing filed: a file system without locks fails closed. |
+| T-28 | T absent | the lock path is a link, not a regular file, not owned by the effective user, writable by group or others, cannot be opened, or the file system has no locks | same | Error that names the lock file. Nothing filed: a file system without locks fails closed. |
 | T-29 | T2, T3 | `Ensure` in the same process through another name for the same token file | T5 for it | A second flow entry, which waits on the lock like another process. |
 
 Invariants:
 
 - **T-I1** Whoever polls a request holds the lock, from before it reads P until its poll loop has ended. So at
   most one process, and one goroutine in it, polls a given request or files for a given token.
-- **T-I2** P is created, replaced and removed, and T is written, only by the lock holder. (T-1 reads T without it; T-21 and T-22 read P without it, and only read.)
+- **T-I2** P is created, replaced and removed, and T is written, only by the lock holder. (T-1 reads T without it; T-4's existence check of P before an early discovery, and T-21 and T-22, read P without it, and only read.)
 - **T-I3** A request is filed only when, under the lock, T is absent and P is absent.
 - **T-I4** T is written only from an approved reply to the request in P, only while T is absent, atomically, with
   mode 0600.
@@ -215,12 +215,12 @@ stateDiagram-v2
 | # | State | Event | Next | Side effects |
 |---|---|---|---|---|
 | L-1 | start, after a `201` | | Waiting | `next` = arrival of the `201` + `I`. |
-| L-2 | start, resumed | | Waiting | `I` and `next` are those P recorded; a `next` in the past, or missing, means now; a `next` more than `I` away means now + `I`. |
+| L-2 | start, resumed | | Waiting | `I` and `next` are those P recorded; a `next` in the past, or missing, means now; a `next` more than `I` away (a clock set back) means now + `I`, and that corrected time is written back to P, so the next short run does not cut it again. |
 | L-3 | Waiting | `next` reached | Polling | |
 | L-4 | Waiting | `next` at or after `expires` | Final wait | |
 | L-5 | Waiting, Final wait | the context ends | Ended: cancelled | P kept. |
 | L-6 | Polling | `202` | Waiting | `I` = the reply's interval if it is readable and at least 1. `next` = arrival + `I`. |
-| L-7 | Polling | `429` | Waiting | `I` = the reply's interval if readable and larger, else `I + 2`. `next` = arrival + `I`. |
+| L-7 | Polling | `429` | Waiting | `I` = the reply's interval if it is readable and at least `I` (at the provider's cap it is unchanged), else `I + 2`. `next` = arrival + `I`. |
 | L-8 | Polling | `200` approved, key within its rule, T absent | Ended: stored | T written atomically, 0600. P removed. Returns key, name, role. |
 | L-9 | Polling | `200` approved, T present | Ended: kept | The existing token is returned. The received key is dropped. P removed. |
 | L-10 | Polling | `200` approved, key breaks its rule | Ended: error | Nothing stored. P removed: the request is spent. |
@@ -255,7 +255,7 @@ One `Source` in a service. Variables:
 |---|---|
 | Memory list **M** | *empty*; *from cache*; *from provider* (the accepted entries of the latest good `200`). |
 | Version marker **E** (the `ETag`) | *unset* or *set*. Sent as `If-None-Match` when set. |
-| Cache file **C** | *absent*; *current* (the body M came from); *older* (an earlier body); *unusable* (not a regular file, writable by group or others, or not a valid list). |
+| Cache file **C** | *absent*; *current* (the body M came from); *older* (an earlier body); *unusable* (not a regular file, not owned by the effective user, writable by group or others, or not a valid list). |
 | Refresher | *not started*, *running*, *stopped* (the context given to `Start` ended). |
 
 | State | What is true |
@@ -288,8 +288,8 @@ stateDiagram-v2
 | K-3 | K2, K3, K4 | `Start` (a pull landed before it) | same | C is not loaded: M is newer. |
 | K-4 | any | `Start` a second time | same | Error. |
 | K-5 | any | pull: good `200`, C written | K2 | C is written first, then M is swapped, so a crash between the two never leaves C older than a list that was live. E = the reply's `ETag` (unset if it has none). |
-| K-6 | any | pull: good `200`, C cannot be written; the older C is removed, or emptied without following a link and only if it is a regular file | K3 | M swapped. **E unset**, so the next pull is a full `200` and the write is tried again. `Pull` returns an error that wraps `ErrCacheWrite`; health says so. |
-| K-7 | any | as K-6, and the older C can be neither removed nor emptied | K4 | As K-6, and logged as an error: a restart while the provider is down would load the older list. |
+| K-6 | any | pull: good `200`, C cannot be written; the older C is removed, or emptied without following a link and only if it is a regular file | K3 | M swapped. **E unset**, so the next pull is a full `200` and the write is tried again. `Pull` returns an error that wraps `ErrCacheWrite`; health says so. Logged once at the start of a streak of failing writes, and once when a write succeeds again, as K-10 does for pulls. |
+| K-7 | any | as K-6, and the older C can be neither removed nor emptied | K4 | As K-6, and logged as an error on its first occurrence in a streak of failing writes: a restart while the provider is down would load the older list. |
 | K-8 | K2 | pull: `304` | K2 | Nothing changes. A success. |
 | K-9 | E unset | pull: `304` | same | A failure: nothing was asked conditionally. |
 | K-10 | any | pull fails: bad body, wrong media type, too large, `401`, `404`, `3xx`, `5xx`, network error, time limit, pull token unreadable | same | M, E and C unchanged. The first failure of a streak is logged, and the recovery. Health holds the error. |
