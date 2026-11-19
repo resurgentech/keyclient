@@ -358,7 +358,10 @@ paths:
                 empty:
                   $ref: '../testdata/keylist/empty.json'
         '304':
-          description: Unchanged since `If-None-Match`. No body.
+          description: |
+            Unchanged since `If-None-Match`. No body. A `304` to a request
+            without `If-None-Match` is a failure at the consumer, and so is a
+            `200` whose media type is not `application/json`.
           headers:
             ETag:
               $ref: '#/components/headers/ETag'
@@ -459,21 +462,28 @@ components:
       properties:
         request_id:
           type: string
-          description: Opaque.
+          pattern: '^[A-Za-z0-9_-]{1,128}$'
+          description: Opaque. Never contains `poll_secret`.
         poll_url:
           type: string
           format: uri
-          description: Absolute URL.
+          description: Absolute URL. `https` whenever the request URL is.
         poll_secret:
           type: string
           description: Opaque. A secret; only the requester holds it.
         approve_url:
           type: string
           format: uri
-          description: Absolute URL where a person approves. It never carries `poll_secret`.
+          maxLength: 2048
+          pattern: '^[!-~]+$'
+          description: |
+            Absolute URL where a person approves: printable ASCII only, no
+            user information, at most 2048 bytes. `https` whenever the
+            request URL is. It never carries `poll_secret`.
         user_code:
           type: string
-          description: For display, such as `BCDF-GHJK`.
+          pattern: '^[A-Za-z0-9-]{1,32}$'
+          description: For display, such as `BCDF-GHJK`. Never contains `poll_secret`.
         interval:
           type: integer
           minimum: 1
@@ -481,7 +491,9 @@ components:
         expires_in:
           type: integer
           minimum: 1
-          description: Seconds until the request expires.
+          description: |
+            Seconds until the request expires. Client limit: a tool treats a
+            value above 86400 (24 hours) as 86400.
     PollPending:
       type: object
       required: [status, interval]

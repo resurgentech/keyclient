@@ -80,12 +80,24 @@ func mkdirPrivate(dir string) error {
 	// stop the next level from being created.
 	for i := len(missing) - 1; i >= 0; i-- {
 		d := missing[i]
-		if err := os.Mkdir(d, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		if beforeMkdir != nil {
+			beforeMkdir(d)
+		}
+		if err := os.Mkdir(d, 0o700); err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				continue // someone else made it: not ours to chmod
+			}
 			return err
 		}
-		if err := os.Chmod(d, 0o700); err != nil {
+		if afterMkdir != nil {
+			afterMkdir(d)
+		}
+		if err := chmodDirNoFollow(d, 0o700); err != nil {
 			return err
 		}
 	}
 	return nil
 }
+
+// Test hooks around each mkdir; nil outside tests.
+var beforeMkdir, afterMkdir func(dir string)

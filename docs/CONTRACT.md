@@ -41,8 +41,8 @@ The consumer gives each request a timeout (10 seconds is suggested), and reads a
 
 | Status | Meaning | Consumer action |
 |---|---|---|
-| `200` | The current list. Body `{"keys":[{"name","role","sha256"}, ...]}`, content type `application/json`, with an `ETag` header holding a quoted, strong validator that the consumer treats as opaque. | Validate, apply, cache, remember the `ETag`. |
-| `304` | Unchanged since `If-None-Match`. No body. | Do nothing. |
+| `200` | The current list. Body `{"keys":[{"name","role","sha256"}, ...]}`, content type `application/json`, with an `ETag` header holding a quoted, strong validator that the consumer treats as opaque. | Validate, apply, cache, remember the `ETag`. A `200` whose media type is not `application/json` is a failure. |
+| `304` | Unchanged since `If-None-Match`. No body. | Do nothing. A `304` to a request that carried no `If-None-Match` is a failure. |
 | `401` | The pull token is missing or wrong. Body `{"error": "<code>", "message": "..."}`. | A failure (below). Log it as an error; this needs an operator. |
 | `404` | The provider has no list for this URL. Same error body. | A failure. It is **not** an empty list and revokes nothing. |
 | anything else, a bad body, a network error, a timeout | | A failure. |
@@ -61,6 +61,8 @@ An empty list, `{"keys": []}`, is a valid `200`. It revokes every pulled key at 
     `alice@laptop`.
   - `role` matches `^[A-Za-z0-9_.-]{1,32}$`. The consumer decides which roles it knows.
   - `sha256` is the lowercase hexadecimal SHA-256 of the key's bytes: `^[0-9a-f]{64}$`.
+- Member names are matched exactly. An object (the body or an entry) that holds the same member name twice, or a
+  member whose name differs from `keys`, `name`, `role` or `sha256` only in letter case, is a bad body.
 - A body that is not valid JSON of this shape, or holds an entry that breaks these patterns, is a bad body: a
   failure. The consumer cannot tell what was meant, so it keeps the last good list.
 - The provider sorts entries by `name` (byte order) and names are unique in a list, so one set of keys always
@@ -87,11 +89,18 @@ To check a presented key, the consumer computes its SHA-256 and compares it, in 
 ### Cache
 
 - After each good `200`, the body is written to `cache_file` atomically (a temporary file in the same directory,
-  then a rename), with mode 0600. A failed cache write is logged; the list is still applied.
-- At start the consumer loads `cache_file` first, with the same checks, then pulls at once. A missing cache is an
-  empty list. A cache that does not parse is ignored and logged.
+  then a rename), with mode 0600. A failed cache write is logged and reported as part of the consumer's health; the
+  list is still applied in memory. The consumer then removes the older cache (or, if it cannot, empties it), so
+  that a later start never loads a list older than one it has already applied.
+- At start the consumer loads `cache_file` first, with the same checks, then pulls at once. It does not load the
+  cache over a list it has already pulled in this process. A missing cache is an empty list. A cache that does not
+  parse is ignored and logged. A cache that is not a regular file, or that group or others can write, is refused
+  and logged; the consumer never blocks opening it.
 - So a restart with the provider down keeps working with the last good list. The service starts even when the
   provider is unreachable. The `ETag` is not stored in the cache.
+- The consumer keeps serving the last good list for as long as the provider is down. There is no staleness
+  cut-off: this is a deliberate availability choice. A revocation made while the provider is unreachable takes
+  effect at the first good pull after it comes back.
 
 ### When a key starts and stops working
 
@@ -104,12 +113,18 @@ A key is valid at a service from the first pull that lists it, and invalid from 
   - **Throttle.** At most one miss-triggered pull starts per `personal_keys.refresh_on_miss` (default `5s`; `0`
     turns the feature off). The throttle covers all callers together.
   - **Waiting.** Misses that arrive while that pull is in flight, the one that started it among them, wait for it,
-    up to 2 s. Every other miss inside the window gets `401` at once, with no pull.
+    up to 2 s. Every other miss inside the window gets `401` at once, with no pull. The consumer may bound how many
+    misses wait at once; a miss past that bound gets `401` at once (the reference consumer lets 100 wait).
+  - **Trailing pull.** When at least one miss inside a window got `401` without a pull, the consumer starts exactly
+    one more miss-triggered pull when that window ends. That pull is the next window's one pull, so there is still
+    at most one miss-triggered pull per window.
   - The miss-triggered pull never moves the timer: the next timed pull comes when it would have come anyway.
 - **Revocation** is unchanged: a revoked key stops within the normal `refresh`, or sooner if a miss-triggered pull
   lands first.
 
-A tool that has just received a key can therefore use it at once and needs no retry.
+A tool that has just received a key can usually use it at once. A tool that has just received a key and is refused
+should wait `refresh_on_miss` and retry once. Someone who sends unknown keys to a service can use up its windows and
+so delay a new key's first use, by about one window and at worst until the next timed pull; they cannot prevent it.
 
 ### Transport
 
@@ -164,6 +179,21 @@ contract: a missing key is the same error as today. Discovery that fails any oth
 other than `200` and `404`, a `request_url` that is not an absolute `http` or `https` URL) is an error the tool
 reports; it files nothing.
 
+**Trust.** The tool trusts the discovery answer exactly as much as it trusts the service. Whoever can answer for
+the service can send the tool to a request URL of their choosing, relay the tool's request to the real provider,
+and so show the person the genuine approval page with a matching code while the key goes to them. What protects
+the flow is that the tool reaches the service over `https` (or a network path it trusts) and, after that, never
+leaves `https`.
+
+### Transport
+
+- A tool uses `https` for the service, the request URL, the poll URL and the approval URL. It refuses plain `http`
+  except to a loopback address, unless its operator has explicitly allowed plain `http`.
+- A flow never downgrades: once one step of the flow is `https` (the service URL, or the request URL when it is
+  given directly), every later URL of that flow (`request_url`, `poll_url`, `approve_url`) must be `https` too,
+  whatever the tool allows otherwise.
+- The tool follows no redirect on any of these calls.
+
 ### Filing a request
 
 `POST <request_url>` with `Content-Type: application/json` and a body of at most 2048 bytes, for example:
@@ -185,13 +215,17 @@ Reply `201` with content type `application/json`:
 
 | Field | Type and rule |
 |---|---|
-| `request_id` | String. Opaque. |
+| `request_id` | String, `^[A-Za-z0-9_-]{1,128}$`. Opaque. |
 | `poll_url` | String. Absolute URL. |
 | `poll_secret` | String. Opaque. A secret: only the requester holds it. |
-| `approve_url` | String. Absolute URL where a person approves. It never carries `poll_secret`. |
-| `user_code` | String for display, such as `BCDF-GHJK`. |
+| `approve_url` | String. Absolute URL where a person approves: printable ASCII only (no space or control character), no user information (`user@`), at most 2048 bytes. It never carries `poll_secret`. |
+| `user_code` | String for display, `^[A-Za-z0-9-]{1,32}$`, such as `BCDF-GHJK`. |
 | `interval` | Integer, at least 1. Seconds between polls. |
 | `expires_in` | Integer, at least 1. Seconds until the request expires. |
+
+A tool refuses a `201` that breaks these rules, or whose `request_id`, `approve_url` or `user_code` contains the
+`poll_secret`; it shows nothing from it. **Client limit:** a tool treats an `expires_in` above 86400 (24 hours) as
+86400.
 
 Errors from filing carry `{"error": "<code>", "message": "..."}` (content type `application/json`):
 
@@ -207,6 +241,8 @@ Errors from filing carry `{"error": "<code>", "message": "..."}` (content type `
 
 The codes the reference provider uses are `bad_request`, `unknown_role`, `unauthorized`, `not_found`, `too_large`,
 `rate_limited`, `capacity` and `internal`. A tool shows `message` to the user and does not branch on `error`.
+Whatever a tool shows from a provider's reply it first reduces to printable characters, and it never shows the
+`poll_secret` or a key, even when the provider echoes them.
 
 The responses to filing and to polling carry `Cache-Control: no-store`.
 
@@ -255,15 +291,18 @@ carries on. No other file changes. A reply with a key that breaks the rule above
 ### Stopping
 
 The tool stops when it gets `403` or `410`, or `expires_in` seconds after the `201` arrived, whichever is first.
-It then reports the outcome and, if the user still needs a key, files a new request only on the next use.
+When its next poll would fall after that time, it polls once more at that time rather than giving up early. It
+then reports the outcome and, if the user still needs a key, files a new request only on the next use.
 
 ### Resuming a pending request
 
 A filed request stays valid until it expires, even if the tool exits. A tool may keep `request_id`, `poll_url`,
 `poll_secret` and the expiry time in a file readable only by its user (mode 0600), and on its next run poll that
-request instead of filing a new one. A tool must not file a second request while it holds an unexpired one,
-because the provider limits how many requests one source may have open. It removes the stored request when the
-request settles (a final status, or the key stored) or expires.
+request instead of filing a new one. It resumes only a request filed for the same service and request URL as the
+current run; otherwise it drops the stored request and files anew. A tool must not file a second request while it
+holds an unexpired one, because the provider limits how many requests one source may have open, and two copies of
+one tool must not poll the same request at once. It removes the stored request when the request settles (a final
+status, or the key stored) or expires.
 
 ### Defaults unchanged
 
