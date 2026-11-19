@@ -41,3 +41,22 @@ are appended, never edited in; a hook refuses rewrites.
 - `internal/atomicfile`: never chmods a directory it did not create, nor through a symlink.
 - Tag `v0.1.0` moved to the new head (it had never been pushed).
 - Commits: dc58b30, 95f764f, 6fafe3b, ef6b0d3, and the commit holding this entry.
+
+## 2026-11-19 — K1 fix round 3: the code matches docs/STATES.md
+
+- `docs/STATES.md` added: every state machine of the flow (provider, tool, poll loop, key list, refresh on miss,
+  start-up and shutdown) with numbered rows and invariants; the packages follow it row by row and the tests are
+  named after the rows. Linked from the README and CONTRACT.md.
+- Contract: an approved request is delivered on any authorised poll before expiry; approval moves the expiry to at
+  least approval plus twice the interval; the interval never exceeds ten times the first; a resumed run keeps the
+  pace; `Accept` answers the same for an entry for the life of a consumer; the list consumer refuses plain http.
+  The fake provider and a new scenario follow.
+- `request`: the background poll keeps the lock; the pending file records the interval and the next poll; a
+  resumed `Wait: false` call polls when due; `Wait: false` never waits for another process (`ErrBusy`, or a
+  pending from the file); discovery before anything is created; crash leftovers removed by the lock holder; a
+  `Notify` panic ends the flow with an error for every caller; `errors.ErrUnsupported`; `Notice.Service`.
+- `keylist`: cache before swap; ETag dropped on a failed write; no link followed when emptying; no pull after
+  shutdown and a cut pull is not a failure; `Status.Origin`, `Status.ListTime`, a real age for a cache list;
+  `Options.AllowInsecureHTTP`; temporary files removed at `Start`.
+- Tag `v0.1.0` moved to the new head (never pushed).
+- Commits: d41a459, f8b43c2, ce45956, and the commit holding this entry.
