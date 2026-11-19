@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -21,6 +20,7 @@ type session struct {
 	pendPath  string
 	unit      time.Duration
 
+	requestID string
 	pollURL   string
 	secret    string
 	interval  int       // seconds, in units of s.unit
@@ -30,131 +30,161 @@ type session struct {
 
 func (s *session) wait() time.Duration { return time.Duration(s.interval) * s.unit }
 
-// drop removes the pending file: the request has settled.
-func (s *session) drop() { os.Remove(s.pendPath) }
+// drop removes the pending file once the request has settled, but only while
+// it still holds this request's id: a pending file of another request is left
+// alone.
+func (s *session) drop() {
+	b, exists, err := readPending(s.pendPath)
+	if err != nil || !exists {
+		return
+	}
+	var pf struct {
+		RequestID string `json:"request_id"`
+	}
+	if json.Unmarshal(b, &pf) != nil || pf.RequestID != s.requestID {
+		return
+	}
+	os.Remove(s.pendPath)
+}
 
-// run polls until the request settles, expires, or ctx ends.
-func (s *session) run(ctx context.Context) (string, error) {
+// pollReply is the body of a poll reply.
+type pollReply struct {
+	Status   string `json:"status"`
+	Interval int    `json:"interval"`
+	Name     string `json:"name"`
+	Role     string `json:"role"`
+	Key      string `json:"key"`
+	Message  string `json:"message"`
+}
+
+// run polls until the request settles, expires, or ctx ends. When the next
+// poll would come at or after the expiry, it polls once more at the expiry
+// and only then, if that reply is not final, returns ErrExpired.
+func (s *session) run(ctx context.Context) (Result, error) {
 	for {
-		if !s.nextAt.Before(s.expiresAt) {
-			s.drop()
-			return "", ErrExpired
+		at, last := s.nextAt, false
+		if !at.Before(s.expiresAt) {
+			at, last = s.expiresAt, true
 		}
-		if err := sleepUntil(ctx, s.nextAt); err != nil {
-			return "", err
+		if err := sleepUntil(ctx, at); err != nil {
+			return Result{}, err
 		}
-		status, body, err := s.post(ctx)
+		status, body, over, err := s.post(ctx)
 		arrived := now()
-		if err != nil {
-			if ctx.Err() != nil {
-				return "", ctx.Err()
-			}
-			s.nextAt = arrived.Add(s.wait()) // transient
-			continue
+		if err != nil && ctx.Err() != nil {
+			return Result{}, ctx.Err()
 		}
-		var b struct {
-			Status   string `json:"status"`
-			Interval int    `json:"interval"`
-			Name     string `json:"name"`
-			Role     string `json:"role"`
-			Key      string `json:"key"`
-			Error    string `json:"error"`
-			Message  string `json:"message"`
-		}
-		readable := json.Unmarshal(body, &b) == nil
+		if err == nil { // a failure to get a reply is transient
+			var b pollReply
+			readable := !over && json.Unmarshal(body, &b) == nil
 
-		switch {
-		case status == http.StatusAccepted:
-			if readable && b.Interval >= 1 {
-				s.interval = clampSeconds(b.Interval)
-			}
-		case status == http.StatusTooManyRequests:
-			if readable && b.Interval > s.interval {
-				s.interval = clampSeconds(b.Interval)
-			} else {
-				s.interval = clampSeconds(s.interval + 2)
-			}
-		case status == http.StatusOK:
-			return s.approved(readable, b.Status, b.Key)
-		case status == http.StatusForbidden:
-			s.drop()
-			return "", ErrDenied
-		case status == http.StatusGone:
-			if readable && b.Status == "consumed" {
-				if tok, err := readToken(s.tokenPath); err == nil && tok != "" {
-					s.drop()
-					return tok, nil
+			switch {
+			case status == http.StatusAccepted:
+				if readable && b.Interval >= 1 {
+					s.interval = min(b.Interval, maxSeconds)
 				}
+			case status == http.StatusTooManyRequests:
+				if readable && b.Interval > s.interval {
+					s.interval = min(b.Interval, maxSeconds)
+				} else {
+					s.interval = min(s.interval+2, maxSeconds)
+				}
+			case status == http.StatusOK:
+				if over {
+					return Result{}, errors.New("key request: the 200 reply is larger than 64 KiB; nothing was stored and the request is kept")
+				}
+				return s.approved(readable, b)
+			case status == http.StatusForbidden:
 				s.drop()
-				return "", ErrConsumed
+				return Result{}, ErrDenied
+			case status == http.StatusGone:
+				if readable && b.Status == "consumed" {
+					s.drop()
+					if tok, err := readToken(s.tokenPath); err == nil && tok != "" {
+						return Result{Token: tok}, nil
+					}
+					return Result{}, ErrConsumed
+				}
+				// expired, or a 410 whose body we cannot read: final either way.
+				s.drop()
+				return Result{}, ErrExpired
+			case status == http.StatusUnauthorized:
+				msg := ""
+				if readable {
+					msg = shown(b.Message, s.secret, maxMessage)
+				}
+				if msg == "" {
+					return Result{}, ErrUnauthorized
+				}
+				return Result{}, fmt.Errorf("%w: %s", ErrUnauthorized, msg)
+			case status >= 500:
+				// transient
+			default:
+				return Result{}, fmt.Errorf("key request: poll answered unexpected status %d; the request is kept", status)
 			}
-			// expired, or a 410 whose body we cannot read: final either way.
+		}
+		if last {
 			s.drop()
-			return "", ErrExpired
-		case status == http.StatusUnauthorized:
-			msg := ""
-			if readable {
-				msg = sanitize(redact(b.Message, s.secret), maxMessage)
-			}
-			if msg == "" {
-				return "", ErrUnauthorized
-			}
-			return "", fmt.Errorf("%w: %s", ErrUnauthorized, msg)
-		case status >= 500:
-			// transient
-		default:
-			return "", fmt.Errorf("key request: poll answered unexpected status %d; the request is kept", status)
+			return Result{}, ErrExpired
 		}
 		s.nextAt = arrived.Add(s.wait())
 	}
 }
 
-// approved stores the key of a 200.
-func (s *session) approved(readable bool, status, key string) (string, error) {
-	if !readable || status != "approved" {
-		return "", errors.New("key request: the 200 reply is not an approved reply; the request is kept")
+// approved stores the key of a 200. If a token has appeared at TokenPath
+// meanwhile (only something outside this package can write it while the
+// request is polled), that token is kept and returned, and the received key is
+// not stored.
+func (s *session) approved(readable bool, b pollReply) (Result, error) {
+	if !readable || b.Status != "approved" {
+		return Result{}, errors.New("key request: the 200 reply is not an approved reply; the request is kept")
 	}
+	key := b.Key
 	if !reKey.MatchString(key) {
 		// The provider has handed the key out, so the request is spent.
 		s.drop()
-		return "", errors.New("key request: the provider sent a key that breaks the key rule (16 to 512 printable ASCII characters, no white space); nothing was stored")
+		return Result{}, errors.New("key request: the provider sent a key that breaks the key rule (16 to 512 printable ASCII characters, no white space); nothing was stored")
+	}
+	if tok, err := readToken(s.tokenPath); err == nil && tok != "" {
+		s.drop()
+		return Result{Token: tok}, nil
 	}
 	if err := atomicfile.Write(s.tokenPath, []byte(key)); err != nil {
 		s.drop() // the key was handed out: the request is consumed
-		return "", fmt.Errorf("key request: approved, but the key could not be stored: %w", err)
+		return Result{}, fmt.Errorf("key request: approved, but the key could not be stored: %w", err)
 	}
 	s.drop()
-	return key, nil
+	res := Result{Token: key}
+	if reName.MatchString(b.Name) && !strings.Contains(b.Name, key) {
+		res.Name = b.Name
+	}
+	if reRole.MatchString(b.Role) && !strings.Contains(b.Role, key) {
+		res.Role = b.Role
+	}
+	return res, nil
 }
 
-// post sends one poll. A non-nil error is a failure to get a reply.
-func (s *session) post(ctx context.Context) (int, []byte, error) {
-	cctx, cancel := context.WithTimeout(ctx, RequestTimeout)
+// post sends one poll. A non-nil error is a failure to get a reply; over is
+// true when the body was larger than MaxReply (then body is nil).
+func (s *session) post(ctx context.Context) (status int, body []byte, over bool, err error) {
+	cctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(cctx, http.MethodPost, s.pollURL, nil)
 	if err != nil {
-		return 0, nil, errors.New("bad poll URL")
+		return 0, nil, false, errors.New("bad poll URL")
 	}
 	req.Header.Set("Authorization", "Bearer "+s.secret)
 	req.Header.Set("Accept", "application/json")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return 0, nil, errors.New("poll failed") // the error text is not used; it would name the URL
+		return 0, nil, false, errors.New("poll failed") // the error text is not used; it would name the URL
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxReply))
+	body, over, err = readReply(resp.Body)
 	if err != nil {
-		return 0, nil, errors.New("poll reply unreadable")
+		return 0, nil, false, errors.New("poll reply unreadable")
 	}
-	return resp.StatusCode, body, nil
-}
-
-// redact removes the secret from s.
-func redact(s, secret string) string {
-	if secret == "" {
-		return s
-	}
-	return strings.ReplaceAll(s, secret, "[redacted]")
+	return resp.StatusCode, body, over, nil
 }
 
 // sleepUntil waits until t, or returns ctx's error if it ends first.

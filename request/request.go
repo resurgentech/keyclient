@@ -8,15 +8,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/resurgentech/keyclient/internal/atomicfile"
 )
@@ -24,7 +25,13 @@ import (
 const (
 	// RequestTimeout bounds each HTTP call (discovery, filing, one poll).
 	RequestTimeout = 30 * time.Second
-	// MaxReply is the most bytes read of any reply.
+	// MaxReply is the most bytes of a reply that are read. A reply with a
+	// longer body is not used: discovery and a 201 are refused with an error
+	// (nothing is filed, shown or stored); a filing error gives a
+	// [ProviderError] without code or message; a poll reply is read as a body
+	// the tool cannot read (a 202 keeps the current interval, a 429 adds 2, a
+	// 410 is final, a 401 has no message), except that a 200 is an error that
+	// stores nothing and keeps the request.
 	MaxReply = 64 << 10
 )
 
@@ -45,34 +52,47 @@ var (
 	ErrUnauthorized = errors.New("key request: poll refused as unauthorized")
 )
 
+// errUnsupported is returned where a request would be filed or resumed on a
+// platform without the file lock.
+var errUnsupported = errors.New("key request: key requests are not supported on this platform")
+
 // second is the unit of intervals and of expires_in; tests shrink it.
 var second = time.Second
 
 // now is the clock.
 var now = time.Now
 
+// requestTimeout is the bound of each HTTP call; tests shrink it.
+var requestTimeout = RequestTimeout
+
 const (
-	maxSeconds   = 1 << 24 // clamp for interval and expires_in, so a Duration cannot overflow
-	maxMessage   = 200
-	maxCode      = 64
-	pendingExt   = ".pending"
-	keyPattern   = `^[!-~]{16,512}$`
-	discoveryURI = "/v1/key-request"
+	maxSeconds    = 1 << 24 // clamp for interval, so a Duration cannot overflow
+	maxExpiresIn  = 86400   // the client limit of the contract: 24 hours
+	maxMessage    = 200
+	maxCode       = 64
+	maxApproveURL = 2048
+	maxPollSecret = 1024
+	pendingExt    = ".pending"
+	lockExt       = ".lock"
+	discoveryURI  = "/v1/key-request"
 )
 
 var (
-	reNameHint = regexp.MustCompile(`^[A-Za-z0-9_.@-]{1,64}$`)
-	reHost     = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
-	reTool     = regexp.MustCompile(`^[A-Za-z0-9_.@/+-]{1,64}$`)
-	reRole     = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,32}$`)
-	reKey      = regexp.MustCompile(keyPattern)
+	reNameHint  = regexp.MustCompile(`^[A-Za-z0-9_.@-]{1,64}$`)
+	reHost      = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+	reTool      = regexp.MustCompile(`^[A-Za-z0-9_.@/+-]{1,64}$`)
+	reRole      = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,32}$`)
+	reName      = reNameHint
+	reRequestID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+	reUserCode  = regexp.MustCompile(`^[A-Za-z0-9-]{1,32}$`)
+	reKey       = regexp.MustCompile(`^[!-~]{16,512}$`)
 )
 
 // ProviderError is a filing error reply (4xx or 5xx, usually with
 // {"error","message"}).
 type ProviderError struct {
 	Status     int
-	Code       string        // for logs; a tool does not branch on it
+	Code       string        // for logs; a tool does not branch on it. Sanitised, at most 64 runes
 	Message    string        // sanitised: printable characters only, at most 200 runes
 	RetryAfter time.Duration // from Retry-After on 429, else 0
 }
@@ -91,10 +111,11 @@ func (e *ProviderError) Error() string {
 // Options are the inputs of [Ensure].
 type Options struct {
 	// ServiceURL is the service's base URL; discovery is GET ServiceURL +
-	// "/v1/key-request" (a trailing / is trimmed).
+	// "/v1/key-request" (a trailing / is trimmed). It must be an absolute
+	// https URL, or plain http to a loopback address (see AllowInsecureHTTP).
 	ServiceURL string
 	// Override is the request URL from the tool's flag or env var; when set,
-	// discovery is not called.
+	// discovery is not called. The same scheme rules as ServiceURL apply.
 	Override string
 	// TokenPath is required: the file the tool reads its token from; the key is
 	// written here.
@@ -111,14 +132,50 @@ type Options struct {
 	// followed: a 3xx is "any other status".
 	HTTPClient *http.Client
 	// Notify is called once per Ensure that files or resumes a request, before
-	// polling. Nil: nothing.
+	// polling. Nil: nothing. A caller that joins a flow already running in
+	// this process is not notified again.
 	Notify func(Notice)
-	// Wait true polls until the request settles. False returns *ErrPending at
-	// once and polls in the background.
+	// AllowInsecureHTTP allows plain http to any host for ServiceURL, Override
+	// and the URLs the provider gives (request_url, poll_url, approve_url). By
+	// default plain http is refused, before anything is sent, unless the host
+	// is a loopback address: "localhost" (by name), 127.0.0.0/8 or ::1.
+	//
+	// It never allows a downgrade: once one step of the flow is https (the
+	// ServiceURL, the Override, or the request_url discovery gives), every
+	// later URL of the flow must be https too, whatever this says.
+	//
+	// The discovery answer is trusted exactly as much as the service. Whoever
+	// can answer for the service can send the tool to a request URL of their
+	// choosing, relay the tool's request to the real provider, and receive the
+	// key while the person sees the genuine approval page and a matching code.
+	// Reaching the service over https is what protects the flow; setting this
+	// gives that up, so set it only for a network path you trust.
+	AllowInsecureHTTP bool
+	// Wait true polls until the request settles. False returns *ErrPending
+	// once the request is filed or resumed, and polls in the background.
 	Wait bool
 }
 
-// Notice is what the user is told when a request is filed or resumed.
+// Result is what [Ensure] returns: the token, and the name and role the
+// provider granted with it.
+//
+// Name and Role are set only when this flow received the key in an approved
+// reply, and each only if it matches its pattern in the contract
+// (^[A-Za-z0-9_.@-]{1,64}$ and ^[A-Za-z0-9_.-]{1,32}$) and does not hold the
+// key; the key is kept either way. When the token was already on disk, or was
+// collected by another holder of the lock (another process, or something that
+// wrote the token file while the request was polled), Name and Role are "". A
+// caller that joined a flow running in this process gets the Result of that
+// flow.
+type Result struct {
+	Token string
+	Name  string
+	Role  string
+}
+
+// Notice is what the user is told when a request is filed or resumed. Every
+// field comes from validated values: the 201 reply (or the pending file) and
+// the options.
 type Notice struct {
 	ApproveURL string
 	UserCode   string
@@ -141,59 +198,54 @@ func (n Notice) String() string {
 }
 
 // ErrPending is returned by [Ensure] with Wait false after it filed or resumed
-// a request. The poll goes on in the background.
+// a request, or when it joins a flow already running in this process. The
+// poll goes on in the background.
 type ErrPending struct {
 	Notice Notice
 
-	done chan struct{}
-	err  error // set before done is closed
+	f *flight
 }
 
 func (e *ErrPending) Error() string { return "key request pending: " + e.Notice.String() }
 
-// Ready reports that the background poll has stored the key at TokenPath.
+// Ready reports that the background poll has ended with the token at
+// TokenPath.
 func (e *ErrPending) Ready() bool {
+	if e.f == nil {
+		return false
+	}
 	select {
-	case <-e.done:
-		return e.err == nil
+	case <-e.f.done:
+		return e.f.err == nil
 	default:
 		return false
 	}
 }
 
 // Done is closed when the background poll ends, key stored or not.
-func (e *ErrPending) Done() <-chan struct{} { return e.done }
+func (e *ErrPending) Done() <-chan struct{} {
+	if e.f == nil {
+		return nil
+	}
+	return e.f.done
+}
 
-// Err is nil until Done is closed; then nil if the key was stored, else why
-// (ErrDenied, ErrExpired, the context's error, ...).
+// Err is nil until Done is closed; then nil if the token is at TokenPath, else
+// why (ErrDenied, ErrExpired, the context's error, ...).
 func (e *ErrPending) Err() error {
+	if e.f == nil {
+		return nil
+	}
 	select {
-	case <-e.done:
-		return e.err
+	case <-e.f.done:
+		return e.f.err
 	default:
 		return nil
 	}
 }
 
-// IsTerminal reports whether f is a character device (os.ModeCharDevice). The
-// check is that of the standard library only: /dev/null is a character device
-// too, so it counts. A calling tool uses it to choose Wait true, or printing the
-// notice and exiting 2.
-func IsTerminal(f *os.File) bool {
-	if f == nil {
-		return false
-	}
-	fi, err := f.Stat()
-	return err == nil && fi.Mode()&os.ModeCharDevice != 0
-}
-
 // PendingPath returns TokenPath + ".pending".
 func PendingPath(tokenPath string) string { return tokenPath + pendingExt }
-
-var (
-	ensureMu sync.Mutex
-	running  = map[string]*ErrPending{} // cleaned TokenPath -> background poll in this process
-)
 
 // pendingFile is the content of the pending file.
 type pendingFile struct {
@@ -206,6 +258,9 @@ type pendingFile struct {
 	Tool       string    `json:"tool"`
 	Interval   int       `json:"interval"`
 	ExpiresAt  time.Time `json:"expires_at"`
+	ServiceURL string    `json:"service_url"` // the ServiceURL of the run that filed it, trailing / trimmed
+	Override   string    `json:"override"`    // the Override of that run
+	RequestURL string    `json:"request_url"` // where it was filed
 }
 
 // Ensure returns the tool's token. If TokenPath holds one it is returned and
@@ -215,116 +270,132 @@ type pendingFile struct {
 //
 // With Wait false the returned error is an *[ErrPending] right after filing or
 // resuming; the poll then runs in a goroutine until ctx ends, so ctx must
-// outlive the call.
-func Ensure(ctx context.Context, o Options) (token string, err error) {
+// outlive the call. Waiting for the lock that another process holds is bounded
+// by ctx too, with Wait false as with Wait true.
+func Ensure(ctx context.Context, o Options) (Result, error) {
 	host, err := o.validate()
 	if err != nil {
-		return "", err
+		return Result{}, err
 	}
-	unit := second
 	tokenPath := filepath.Clean(o.TokenPath)
-	pendPath := PendingPath(tokenPath)
-
 	if tok, err := readToken(tokenPath); err != nil || tok != "" {
-		return tok, err
+		return Result{Token: tok}, err
 	}
+	pol := policy{insecure: o.AllowInsecureHTTP}
+	switch {
+	case o.Override != "":
+		_, pol, err = pol.check("Override", o.Override)
+	case o.ServiceURL != "":
+		_, pol, err = pol.check("ServiceURL", o.ServiceURL)
+	default:
+		return Result{}, ErrNoProvider
+	}
+	if err != nil {
+		return Result{}, err
+	}
+	for {
+		f, owner := startOrJoin(tokenPath)
+		if owner {
+			return o.own(ctx, f, tokenPath, host, pol)
+		}
+		res, err, again := f.join(ctx, o.Wait)
+		if !again {
+			return res, err
+		}
+	}
+}
 
-	ensureMu.Lock()
+// own runs the flow of f: it takes the lock, then resumes or files, notifies
+// and polls.
+func (o Options) own(ctx context.Context, f *flight, tokenPath, host string, pol policy) (res Result, err error) {
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			f.finish(res, err) // a no-op if already finished; also covers a panic in Notify
+		}
+	}()
+	unlock, err := lockFile(ctx, tokenPath+lockExt)
+	if err != nil {
+		return Result{}, err
+	}
 	locked := true
-	unlock := func() {
+	release := func() {
 		if locked {
 			locked = false
-			ensureMu.Unlock()
+			unlock()
 		}
 	}
-	defer unlock()
+	defer release()
 
 	if tok, err := readToken(tokenPath); err != nil || tok != "" {
-		return tok, err
+		return Result{Token: tok}, err
 	}
-	if ep := running[tokenPath]; ep != nil {
-		unlock()
-		if !o.Wait {
-			return "", ep
-		}
-		select {
-		case <-ep.done:
-		case <-ctx.Done():
-			return "", ctx.Err()
-		}
-		if ep.err != nil {
-			return "", ep.err
-		}
-		return readToken2(tokenPath)
-	}
-
-	client := o.client()
-	s := &session{
-		client: client, tokenPath: tokenPath, pendPath: pendPath, unit: unit,
-	}
-	var notice Notice
-
-	pf, resumed, err := loadPending(pendPath)
+	s, notice, err := o.start(ctx, tokenPath, host, pol)
 	if err != nil {
-		return "", err
+		return Result{}, err
 	}
-	if resumed {
-		s.pollURL, s.secret, s.interval, s.expiresAt = pf.PollURL, pf.PollSecret, pf.Interval, pf.ExpiresAt
-		s.nextAt = now().Add(s.wait())
-		notice = Notice{ApproveURL: pf.ApproveURL, UserCode: pf.UserCode, Role: pf.Role, Tool: pf.Tool, ExpiresAt: pf.ExpiresAt, Resumed: true}
-	} else {
-		reqURL, err := o.requestURL(ctx, client)
-		if err != nil {
-			return "", err
-		}
-		pf, arrived, err := fileRequest(ctx, client, reqURL, o, host)
-		if err != nil {
-			return "", err
-		}
-		pf.ExpiresAt = arrived.Add(time.Duration(clampSeconds(pf.expiresIn)) * unit)
-		fileData, err := json.Marshal(pf.pendingFile)
-		if err != nil {
-			return "", err
-		}
-		if err := atomicfile.Write(pendPath, fileData); err != nil {
-			return "", fmt.Errorf("key request: cannot store the pending request: %w", err)
-		}
-		s.pollURL, s.secret, s.interval, s.expiresAt = pf.PollURL, pf.PollSecret, pf.Interval, pf.ExpiresAt
-		s.nextAt = arrived.Add(s.wait())
-		notice = Notice{ApproveURL: pf.ApproveURL, UserCode: pf.UserCode, Role: pf.Role, Tool: pf.Tool, ExpiresAt: pf.ExpiresAt}
-	}
-
-	var ep *ErrPending
-	if !o.Wait {
-		ep = &ErrPending{Notice: notice, done: make(chan struct{})}
-		running[tokenPath] = ep
-	}
-	unlock()
+	ep := f.pending(notice)
 	if o.Notify != nil {
 		o.Notify(notice)
 	}
 	if o.Wait {
-		return s.run(ctx)
+		res, err := s.run(ctx)
+		f.finish(res, err)
+		return res, err
 	}
+	// Wait false: the lock is released here; the background poll goes on
+	// under the in-process table only.
+	release()
+	handedOff = true
 	go func() {
-		_, err := s.run(ctx)
-		ep.err = err
-		ensureMu.Lock()
-		if running[tokenPath] == ep {
-			delete(running, tokenPath)
-		}
-		ensureMu.Unlock()
-		close(ep.done)
+		res, err := s.run(ctx)
+		f.finish(res, err)
 	}()
-	return "", ep
+	return Result{}, ep
 }
 
-func readToken2(path string) (string, error) {
-	tok, err := readToken(path)
-	if err == nil && tok == "" {
-		err = errors.New("key request: the request ended but " + path + " holds no token")
+// start resumes the pending request, or files a new one and stores it. The
+// caller holds the lock.
+func (o Options) start(ctx context.Context, tokenPath, host string, pol policy) (*session, Notice, error) {
+	unit := second
+	client := o.client()
+	pendPath := PendingPath(tokenPath)
+	s := &session{client: client, tokenPath: tokenPath, pendPath: pendPath, unit: unit}
+	serviceURL := strings.TrimRight(o.ServiceURL, "/")
+
+	pf, resumed, err := loadPending(pendPath, serviceURL, o.Override, pol, unit)
+	if err != nil {
+		return nil, Notice{}, err
 	}
-	return tok, err
+	var arrived time.Time
+	if resumed {
+		arrived = now()
+	} else {
+		reqURL, rpol := o.Override, pol
+		if reqURL == "" {
+			if reqURL, rpol, err = o.discover(ctx, client, pol); err != nil {
+				return nil, Notice{}, err
+			}
+		}
+		var c created
+		c, arrived, err = fileRequest(ctx, client, reqURL, rpol, o, host)
+		if err != nil {
+			return nil, Notice{}, err
+		}
+		pf = c.pendingFile
+		pf.ExpiresAt = arrived.Add(time.Duration(min(c.expiresIn, maxExpiresIn)) * unit)
+		pf.ServiceURL, pf.Override, pf.RequestURL = serviceURL, o.Override, reqURL
+		data, err := json.Marshal(pf)
+		if err != nil {
+			return nil, Notice{}, err
+		}
+		if err := atomicfile.Write(pendPath, data); err != nil {
+			return nil, Notice{}, fmt.Errorf("key request: cannot store the pending request: %w", err)
+		}
+	}
+	s.requestID, s.pollURL, s.secret, s.interval, s.expiresAt = pf.RequestID, pf.PollURL, pf.PollSecret, pf.Interval, pf.ExpiresAt
+	s.nextAt = arrived.Add(s.wait())
+	return s, Notice{ApproveURL: pf.ApproveURL, UserCode: pf.UserCode, Role: pf.Role, Tool: pf.Tool, ExpiresAt: pf.ExpiresAt, Resumed: resumed}, nil
 }
 
 // readToken returns the trimmed content of path; "" when it is missing or empty.
@@ -349,6 +420,8 @@ func (o Options) client() *http.Client {
 }
 
 // validate checks the options before any I/O and returns the host to send.
+// The URLs are checked in Ensure after the token file is read: a token on disk
+// is returned whatever they are.
 func (o Options) validate() (host string, err error) {
 	if o.TokenPath == "" {
 		return "", errors.New("key request: TokenPath is required")
@@ -382,57 +455,89 @@ func (o Options) validate() (host string, err error) {
 	return host, nil
 }
 
-// absoluteHTTP reports whether s is an absolute http or https URL.
-func absoluteHTTP(s string) (*url.URL, bool) {
-	u, err := url.Parse(s)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return nil, false
-	}
-	return u, true
+// policy is the scheme rule for the next URL of a flow.
+type policy struct {
+	insecure bool // Options.AllowInsecureHTTP
+	https    bool // a step of the flow was https: no plain http from here on
 }
 
-// requestURL is the Override, else the one discovery gives.
-func (o Options) requestURL(ctx context.Context, c *http.Client) (string, error) {
-	if o.Override != "" {
-		if _, ok := absoluteHTTP(o.Override); !ok {
-			return "", errors.New("key request: Override is not an absolute http or https URL")
-		}
-		return o.Override, nil
+// check checks one URL of the flow and returns it parsed, with the policy for
+// the URLs after it. The error names the URL, never its value.
+func (p policy) check(name, raw string) (*url.URL, policy, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return nil, p, fmt.Errorf("key request: %s is not an absolute http or https URL", name)
 	}
-	if o.ServiceURL == "" {
-		return "", ErrNoProvider
+	if u.Scheme == "https" {
+		p.https = true
+		return u, p, nil
 	}
+	if p.https {
+		return nil, p, fmt.Errorf("key request: %s is not https although an earlier step of the flow is; refusing to downgrade", name)
+	}
+	if !p.insecure && !isLoopback(u.Hostname()) {
+		return nil, p, fmt.Errorf("key request: %s uses plain http to a host that is not a loopback address; use https, or set AllowInsecureHTTP for a network path you trust", name)
+	}
+	return u, p, nil
+}
+
+// isLoopback reports whether host is "localhost" or a loopback IP address.
+func isLoopback(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	a, err := netip.ParseAddr(host)
+	return err == nil && a.Unmap().IsLoopback()
+}
+
+// readReply reads a body of at most MaxReply bytes; over is true when there was
+// more (then b is nil).
+func readReply(r io.Reader) (b []byte, over bool, err error) {
+	b, err = io.ReadAll(io.LimitReader(r, MaxReply+1))
+	if len(b) > MaxReply {
+		return nil, true, err
+	}
+	return b, false, err
+}
+
+// discover asks the service for the request URL. pol is the policy after the
+// ServiceURL; the one returned is the policy after the request URL.
+func (o Options) discover(ctx context.Context, c *http.Client, pol policy) (string, policy, error) {
 	u := strings.TrimRight(o.ServiceURL, "/") + discoveryURI
-	cctx, cancel := context.WithTimeout(ctx, RequestTimeout)
+	cctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(cctx, http.MethodGet, u, nil)
 	if err != nil {
-		return "", fmt.Errorf("key request: bad ServiceURL: %w", err)
+		return "", pol, fmt.Errorf("key request: bad ServiceURL: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
 	resp, err := c.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("key request: discovery failed: %w", err)
+		return "", pol, fmt.Errorf("key request: discovery failed: %w", err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxReply))
+	body, over, _ := readReply(resp.Body)
 	switch resp.StatusCode {
 	case http.StatusNotFound:
-		return "", ErrNoProvider
+		return "", pol, ErrNoProvider
 	case http.StatusOK:
 	default:
-		return "", fmt.Errorf("key request: discovery answered status %d", resp.StatusCode)
+		return "", pol, fmt.Errorf("key request: discovery answered status %d", resp.StatusCode)
+	}
+	if over {
+		return "", pol, errors.New("key request: the discovery reply is larger than 64 KiB; refused")
 	}
 	var d struct {
 		RequestURL string `json:"request_url"`
 	}
 	if json.Unmarshal(body, &d) != nil {
-		return "", errors.New("key request: discovery reply is not valid JSON")
+		return "", pol, errors.New("key request: discovery reply is not valid JSON")
 	}
-	if _, ok := absoluteHTTP(d.RequestURL); !ok {
-		return "", errors.New("key request: discovery gave a request_url that is not an absolute http or https URL")
+	_, pol, err = pol.check("the request_url from discovery", d.RequestURL)
+	if err != nil {
+		return "", pol, err
 	}
-	return d.RequestURL, nil
+	return d.RequestURL, pol, nil
 }
 
 type created struct {
@@ -440,18 +545,19 @@ type created struct {
 	expiresIn int
 }
 
-// fileRequest posts the request and validates the 201.
-func fileRequest(ctx context.Context, c *http.Client, reqURL string, o Options, host string) (created, time.Time, error) {
+// fileRequest posts the request and validates the 201. pol is the policy after
+// the request URL.
+func fileRequest(ctx context.Context, c *http.Client, reqURL string, pol policy, o Options, host string) (created, time.Time, error) {
 	var zero created
 	body, err := json.Marshal(map[string]string{"name_hint": o.NameHint, "host": host, "tool": o.Tool, "role": o.Role})
 	if err != nil {
 		return zero, time.Time{}, err
 	}
-	cctx, cancel := context.WithTimeout(ctx, RequestTimeout)
+	cctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(cctx, http.MethodPost, reqURL, bytes.NewReader(body))
 	if err != nil {
-		return zero, time.Time{}, fmt.Errorf("key request: bad request URL: %w", err)
+		return zero, time.Time{}, errors.New("key request: bad request URL")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -461,21 +567,27 @@ func fileRequest(ctx context.Context, c *http.Client, reqURL string, o Options, 
 		return zero, time.Time{}, fmt.Errorf("key request: filing failed: %w", err)
 	}
 	defer resp.Body.Close()
-	reply, _ := io.ReadAll(io.LimitReader(resp.Body, MaxReply))
+	reply, over, rerr := readReply(resp.Body)
 
 	if resp.StatusCode != http.StatusCreated {
 		pe := &ProviderError{Status: resp.StatusCode}
 		var m struct{ Error, Message string }
-		if json.Unmarshal(reply, &m) == nil {
+		if !over && json.Unmarshal(reply, &m) == nil {
 			pe.Code = sanitize(m.Error, maxCode)
 			pe.Message = sanitize(m.Message, maxMessage)
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if n, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); err == nil && n > 0 {
-				pe.RetryAfter = time.Duration(clampSeconds(n)) * time.Second
+				pe.RetryAfter = time.Duration(min(n, maxSeconds)) * time.Second
 			}
 		}
 		return zero, time.Time{}, pe
+	}
+	if over {
+		return zero, time.Time{}, errors.New("key request: the 201 reply is larger than 64 KiB; refused")
+	}
+	if rerr != nil {
+		return zero, time.Time{}, errors.New("key request: the 201 reply could not be read")
 	}
 
 	var r struct {
@@ -488,83 +600,129 @@ func fileRequest(ctx context.Context, c *http.Client, reqURL string, o Options, 
 		ExpiresIn  int    `json:"expires_in"`
 	}
 	if json.Unmarshal(reply, &r) != nil {
-		return zero, time.Time{}, errors.New("key request: the 201 reply is not valid JSON of the expected shape")
-	}
-	for _, f := range []struct{ name, v string }{
-		{"request_id", r.RequestID}, {"poll_secret", r.PollSecret}, {"user_code", r.UserCode},
-	} {
-		if f.v == "" {
-			return zero, time.Time{}, fmt.Errorf("key request: the 201 reply lacks %s", f.name)
-		}
+		return zero, time.Time{}, errors.New("key request: refused the 201 reply: it is not valid JSON of the expected shape")
 	}
 	if r.Interval < 1 {
-		return zero, time.Time{}, errors.New("key request: the 201 reply has an interval below 1")
+		return zero, time.Time{}, errors.New("key request: refused the 201 reply: interval is below 1")
 	}
 	if r.ExpiresIn < 1 {
-		return zero, time.Time{}, errors.New("key request: the 201 reply has an expires_in below 1")
+		return zero, time.Time{}, errors.New("key request: refused the 201 reply: expires_in is below 1")
 	}
-	pu, ok := absoluteHTTP(r.PollURL)
-	if !ok {
-		return zero, time.Time{}, errors.New("key request: the 201 reply has a poll_url that is not an absolute http or https URL")
-	}
-	if _, ok := absoluteHTTP(r.ApproveURL); !ok {
-		return zero, time.Time{}, errors.New("key request: the 201 reply has an approve_url that is not an absolute http or https URL")
-	}
-	if ru, _ := absoluteHTTP(reqURL); ru != nil && ru.Scheme == "https" && pu.Scheme != "https" {
-		return zero, time.Time{}, errors.New("key request: poll_url is not https although the request URL is; refusing to send the poll secret in clear")
+	if why := checkRequest(pol, r.RequestID, r.PollURL, r.PollSecret, r.ApproveURL, r.UserCode); why != "" {
+		return zero, time.Time{}, errors.New("key request: refused the 201 reply: " + why)
 	}
 	return created{
 		pendingFile: pendingFile{
 			RequestID: r.RequestID, PollURL: r.PollURL, PollSecret: r.PollSecret, ApproveURL: r.ApproveURL,
-			UserCode: r.UserCode, Role: o.Role, Tool: o.Tool, Interval: clampSeconds(r.Interval),
+			UserCode: r.UserCode, Role: o.Role, Tool: o.Tool, Interval: min(r.Interval, maxSeconds),
 		},
 		expiresIn: r.ExpiresIn,
 	}, arrived, nil
 }
 
-// loadPending reads the pending file. resumed is false when there is none or it
-// has expired (then it is removed).
-func loadPending(path string) (pf pendingFile, resumed bool, err error) {
-	f, err := os.Open(path)
+// checkRequest checks the values of a request that came from the provider, in
+// a 201 or in the pending file. It returns why they are refused, naming fields
+// only, or "".
+func checkRequest(pol policy, requestID, pollURL, secret, approveURL, userCode string) string {
+	if !reRequestID.MatchString(requestID) {
+		return "request_id is missing or breaks its rule"
+	}
+	if !reUserCode.MatchString(userCode) {
+		return "user_code is missing or breaks its rule"
+	}
+	if len(secret) > maxPollSecret || !printableASCII(secret) {
+		return "poll_secret is missing, longer than 1024 bytes, or not printable ASCII"
+	}
+	if len(approveURL) > maxApproveURL || !printableASCII(approveURL) {
+		return "approve_url is missing, longer than 2048 bytes, or not printable ASCII without spaces"
+	}
+	au, _, err := pol.check("approve_url", approveURL)
+	if err != nil {
+		return strings.TrimPrefix(err.Error(), "key request: ")
+	}
+	if au.User != nil {
+		return "approve_url carries user information"
+	}
+	if _, _, err := pol.check("poll_url", pollURL); err != nil {
+		return strings.TrimPrefix(err.Error(), "key request: ")
+	}
+	if strings.Contains(requestID, secret) || strings.Contains(approveURL, secret) || strings.Contains(userCode, secret) {
+		return "request_id, approve_url or user_code holds the poll secret"
+	}
+	return ""
+}
+
+// printableASCII reports whether s is not empty and every byte is 0x21 to 0x7e.
+func printableASCII(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x21 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+// readPending reads the pending file without following a symlink and without
+// blocking on a FIFO. exists is false when there is none.
+func readPending(path string) (b []byte, exists bool, err error) {
+	f, err := os.OpenFile(path, pendingOpenFlags, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return pf, false, nil
+			return nil, false, nil
 		}
-		return pf, false, fmt.Errorf("key request: cannot open the pending file: %w", err)
+		return nil, true, fmt.Errorf("key request: cannot open the pending file %s: %w", path, err)
 	}
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {
-		return pf, false, fmt.Errorf("key request: cannot stat the pending file %s: %w", path, err)
+		return nil, true, fmt.Errorf("key request: cannot stat the pending file %s: %w", path, err)
 	}
 	if !fi.Mode().IsRegular() || fi.Mode().Perm()&0o077 != 0 {
-		return pf, false, fmt.Errorf("key request: the pending file %s must be a regular file readable only by its owner (mode 0600); fix its mode or remove it", path)
+		return nil, true, fmt.Errorf("key request: the pending file %s must be a regular file readable only by its owner (mode 0600); fix its mode or remove it", path)
 	}
-	b, err := io.ReadAll(io.LimitReader(f, MaxReply))
-	if err != nil {
-		return pf, false, fmt.Errorf("key request: cannot read the pending file %s: %w", path, err)
+	b, over, err := readReply(f)
+	if err != nil || over {
+		return nil, true, fmt.Errorf("key request: the pending file %s cannot be used; remove it (unreadable, or larger than 64 KiB)", path)
 	}
-	bad := fmt.Errorf("key request: the pending file %s cannot be used; remove it", path)
-	dec := json.NewDecoder(bytes.NewReader(b))
-	if dec.Decode(&pf) != nil || pf.PollSecret == "" || pf.Interval < 1 || pf.ExpiresAt.IsZero() {
-		return pendingFile{}, false, bad
+	return b, true, nil
+}
+
+// loadPending reads the pending file. resumed is false when there is none, or
+// when it is for another ServiceURL or Override, or has expired: then it is
+// removed (the caller holds the lock). serviceURL is trimmed of a trailing /.
+func loadPending(path, serviceURL, override string, pol policy, unit time.Duration) (pf pendingFile, resumed bool, err error) {
+	b, exists, err := readPending(path)
+	if err != nil || !exists {
+		return pf, false, err
 	}
-	if _, ok := absoluteHTTP(pf.PollURL); !ok {
-		return pendingFile{}, false, bad
+	bad := func(why string) error {
+		return fmt.Errorf("key request: the pending file %s cannot be used; remove it (%s)", path, why)
 	}
-	pf.Interval = clampSeconds(pf.Interval)
-	if !now().Before(pf.ExpiresAt) {
+	if json.Unmarshal(b, &pf) != nil {
+		return pendingFile{}, false, bad("not valid JSON of the expected shape")
+	}
+	if pf.ServiceURL != serviceURL || pf.Override != override || !now().Before(pf.ExpiresAt) {
 		os.Remove(path)
 		return pendingFile{}, false, nil
 	}
-	return pf, true, nil
-}
-
-func clampSeconds(n int) int {
-	if n > maxSeconds {
-		return maxSeconds
+	if !reRole.MatchString(pf.Role) || !reTool.MatchString(pf.Tool) || pf.Interval < 1 {
+		return pendingFile{}, false, bad("role, tool or interval breaks its rule")
 	}
-	return n
+	_, rpol, err := pol.check("request_url", pf.RequestURL)
+	if err != nil {
+		return pendingFile{}, false, bad(strings.TrimPrefix(err.Error(), "key request: "))
+	}
+	if why := checkRequest(rpol, pf.RequestID, pf.PollURL, pf.PollSecret, pf.ApproveURL, pf.UserCode); why != "" {
+		return pendingFile{}, false, bad(why)
+	}
+	pf.Interval = min(pf.Interval, maxSeconds)
+	if limit := now().Add(maxExpiresIn * unit); pf.ExpiresAt.After(limit) {
+		pf.ExpiresAt = limit
+	}
+	return pf, true, nil
 }
 
 // sanitize keeps printable characters, turns other white space into a space,
@@ -586,4 +744,23 @@ func sanitize(s string, max int) string {
 		}
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// shown is a provider's text as the tool shows it: sanitised first, then the
+// secret redacted, then cut at max runes, so that neither characters dropped
+// by sanitising nor the cut can keep the secret from the redaction.
+func shown(s, secret string, max int) string {
+	s = redact(sanitize(s, utf8.RuneCountInString(s)), secret)
+	if utf8.RuneCountInString(s) > max {
+		s = string([]rune(s)[:max])
+	}
+	return strings.TrimSpace(s)
+}
+
+// redact removes the secret from s.
+func redact(s, secret string) string {
+	if secret == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, secret, "[redacted]")
 }

@@ -44,8 +44,8 @@ func ExampleEnsure() {
 	dir, _ := os.MkdirTemp("", "keyclient-example-")
 	defer os.RemoveAll(dir)
 
-	token, err := request.Ensure(context.Background(), request.Options{
-		ServiceURL: srv.URL,                     // the service's base URL
+	res, err := request.Ensure(context.Background(), request.Options{
+		ServiceURL: srv.URL,                     // the service's base URL (loopback http here; use https)
 		TokenPath:  filepath.Join(dir, "token"), // where the tool reads its token
 		Role:       "agent",                     // the tool documents its default
 		NameHint:   "alice@laptop",              // user@host
@@ -64,10 +64,10 @@ func ExampleEnsure() {
 		fmt.Println("error:", err)
 		return
 	}
-	fmt.Println("stored, length", len(token))
+	fmt.Println("stored, length", len(res.Token), "name:", res.Name, "role:", res.Role)
 	// Output:
 	// approve code: BCDF-GHJK role: agent tool: mytool/0.3.0
-	// stored, length 45
+	// stored, length 45 name: alice@laptop role: agent
 }
 
 // A long-running server (an MCP-style tool) must not block: with Wait false
@@ -99,10 +99,11 @@ func ExampleEnsure_background() {
 	<-pending.Done() // a server does not wait; it checks later
 	fmt.Println("ready:", pending.Ready(), "err:", pending.Err())
 
-	token, err := request.Ensure(context.Background(), opts) // now returns the stored token
-	fmt.Println("token length", len(token), "err:", err)
+	// Now returns the stored token. It was on disk, so Name and Role are empty.
+	res, err := request.Ensure(context.Background(), opts)
+	fmt.Printf("token length %d name %q err: %v\n", len(res.Token), res.Name, err)
 	// Output:
 	// pending, code BCDF-GHJK ready: false
 	// ready: true err: <nil>
-	// token length 45 err: <nil>
+	// token length 45 name "" err: <nil>
 }

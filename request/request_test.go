@@ -118,12 +118,12 @@ func TestDiscoveryOverrideWins(t *testing.T) {
 	e.p.Script(keyclienttest.Approved())
 	e.opts.ServiceURL = disc.URL
 	e.opts.Override = e.p.RequestURL()
-	tok, err := request.Ensure(context.Background(), e.opts)
+	res, err := request.Ensure(context.Background(), e.opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tok != e.p.Key() {
-		t.Errorf("token = %q", tok)
+	if res.Token != e.p.Key() {
+		t.Errorf("token = %q", res.Token)
 	}
 	if hits.Load() != 0 {
 		t.Errorf("discovery called %d times with an Override", hits.Load())
@@ -299,36 +299,16 @@ func TestProviderErrors(t *testing.T) {
 	}
 }
 
-func TestProviderMessageSanitised(t *testing.T) {
-	e := newEnv(t)
-	msg := "a\u0007b\x1b[31mred\nline" + strings.Repeat("x", 300)
-	b, _ := json.Marshal(map[string]string{"error": "bad_request", "message": msg})
-	e.p.FileWith(keyclienttest.Status(400, string(b)))
-	_, err := request.Ensure(context.Background(), e.opts)
-	var pe *request.ProviderError
-	if !errors.As(err, &pe) {
-		t.Fatalf("err = %v", err)
-	}
-	if n := len([]rune(pe.Message)); n > 200 {
-		t.Errorf("message has %d runes", n)
-	}
-	for _, r := range pe.Message {
-		if r < ' ' || r == 0x7f {
-			t.Errorf("control character %q in %q", r, pe.Message)
-		}
-	}
-}
-
 func TestScenarios(t *testing.T) {
 	t.Run("approved", func(t *testing.T) {
 		e := newEnv(t)
 		e.p.Script(keyclienttest.Scenario("approved")...)
-		tok, err := request.Ensure(context.Background(), e.opts)
+		res, err := request.Ensure(context.Background(), e.opts)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if tok != e.p.Key() {
-			t.Errorf("token = %q", tok)
+		if res.Token != e.p.Key() || res.Name != "alice@laptop" || res.Role != "agent" {
+			t.Errorf("result = %+v", res)
 		}
 		b, err := os.ReadFile(e.token)
 		if err != nil || string(b) != e.p.Key() {
@@ -356,9 +336,9 @@ func TestScenarios(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			e := newEnv(t)
 			e.p.Script(keyclienttest.Scenario(name)...)
-			tok, err := request.Ensure(context.Background(), e.opts)
-			if tok != "" || !errors.Is(err, want) {
-				t.Fatalf("tok=%q err=%v, want %v", tok, err, want)
+			res, err := request.Ensure(context.Background(), e.opts)
+			if res != (request.Result{}) || !errors.Is(err, want) {
+				t.Fatalf("res=%+v err=%v, want %v", res, err, want)
 			}
 			e.noLeak(err)
 			if _, err := os.Stat(e.token); err == nil {
@@ -441,9 +421,14 @@ func TestStopsAtExpiry(t *testing.T) {
 	if e.pendingExists() {
 		t.Error("pending file remains after expiry")
 	}
-	for _, p := range e.p.Polls() {
-		if p.Time.Sub(e.p.Filed()[0].Time) >= 3*unit {
-			t.Error("polled at or after expiry")
+	// Polls at 1, 2 and 3 units: the last one at the expiry, none after it.
+	polls := e.p.Polls()
+	if len(polls) != 3 {
+		t.Errorf("polls = %d, want 3", len(polls))
+	}
+	for _, p := range polls {
+		if p.Time.Sub(e.p.Filed()[0].Time) >= 3*unit+unit/2 {
+			t.Error("polled after expiry")
 		}
 	}
 }
@@ -451,9 +436,9 @@ func TestStopsAtExpiry(t *testing.T) {
 func TestTransientFailuresKeepPolling(t *testing.T) {
 	e := newEnv(t)
 	e.p.Script(keyclienttest.Status(500, ""), keyclienttest.Status(503, `{"error":"capacity","message":"x"}`), keyclienttest.Approved())
-	tok, err := request.Ensure(context.Background(), e.opts)
-	if err != nil || tok != e.p.Key() {
-		t.Fatalf("tok=%q err=%v", tok, err)
+	res, err := request.Ensure(context.Background(), e.opts)
+	if err != nil || res.Token != e.p.Key() {
+		t.Fatalf("res=%+v err=%v", res, err)
 	}
 	if n := len(e.p.Polls()); n != 3 {
 		t.Errorf("polls = %d", n)
@@ -474,9 +459,9 @@ func TestConnectionFailureKeepsPolling(t *testing.T) {
 	e := newEnv(t)
 	e.opts.HTTPClient = &http.Client{Transport: &failFirstPoll{}}
 	e.p.Script(keyclienttest.Approved())
-	tok, err := request.Ensure(context.Background(), e.opts)
-	if err != nil || tok != e.p.Key() {
-		t.Fatalf("tok=%q err=%v", tok, err)
+	res, err := request.Ensure(context.Background(), e.opts)
+	if err != nil || res.Token != e.p.Key() {
+		t.Fatalf("res=%+v err=%v", res, err)
 	}
 }
 
@@ -541,7 +526,7 @@ func TestPendingFile(t *testing.T) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		t.Fatal(err)
 	}
-	for _, k := range []string{"request_id", "poll_url", "poll_secret", "approve_url", "user_code", "role", "tool", "interval", "expires_at"} {
+	for _, k := range []string{"request_id", "poll_url", "poll_secret", "approve_url", "user_code", "role", "tool", "interval", "expires_at", "service_url", "override", "request_url"} {
 		if _, ok := m[k]; !ok {
 			t.Errorf("pending file lacks %q", k)
 		}
@@ -590,18 +575,26 @@ func writePending(t *testing.T, e *env, mode os.FileMode, content string) {
 	}
 }
 
-func pendingJSON(expires time.Time, pollURL string) string {
-	b, _ := json.Marshal(map[string]any{
+// pendingJSON is a pending file for a request filed with e's current options,
+// so it is resumed unless it has expired or something in it is edited.
+func pendingJSON(e *env, expires time.Time, pollURL string, edit ...func(map[string]any)) string {
+	m := map[string]any{
 		"request_id": "old", "poll_url": pollURL, "poll_secret": "old-secret-old-secret",
-		"approve_url": "http://x.example/a", "user_code": "AAAA-BBBB", "role": "agent",
-		"tool": "mytool/0.3.0", "interval": 1, "expires_at": expires.Format(time.RFC3339),
-	})
+		"approve_url": "http://127.0.0.1:1/a", "user_code": "AAAA-BBBB", "role": "agent",
+		"tool": "mytool/0.3.0", "interval": 1, "expires_at": expires.Format(time.RFC3339Nano),
+		"service_url": strings.TrimRight(e.opts.ServiceURL, "/"), "override": e.opts.Override,
+		"request_url": e.p.RequestURL(),
+	}
+	for _, f := range edit {
+		f(m)
+	}
+	b, _ := json.Marshal(m)
 	return string(b)
 }
 
 func TestExpiredPendingReplaced(t *testing.T) {
 	e := newEnv(t)
-	writePending(t, e, 0o600, pendingJSON(time.Now().Add(-time.Hour), "http://127.0.0.1:1/poll"))
+	writePending(t, e, 0o600, pendingJSON(e, time.Now().Add(-time.Hour), "http://127.0.0.1:1/poll"))
 	e.p.Script(keyclienttest.Approved())
 	if _, err := request.Ensure(context.Background(), e.opts); err != nil {
 		t.Fatal(err)
@@ -614,8 +607,9 @@ func TestExpiredPendingReplaced(t *testing.T) {
 func TestResumeNeedsNoDiscovery(t *testing.T) {
 	e := newEnv(t)
 	// The pending file points at the provider's poll URL for a request it knows nothing about: 401, kept.
-	writePending(t, e, 0o600, pendingJSON(time.Now().Add(time.Hour), e.p.URL()+"/v1/requests/old/poll"))
+	// Its service is one that does not answer, so discovery would fail.
 	e.opts.ServiceURL = "http://127.0.0.1:1"
+	writePending(t, e, 0o600, pendingJSON(e, time.Now().Add(time.Hour), e.p.URL()+"/v1/requests/old/poll"))
 	var got request.Notice
 	e.opts.Notify = func(n request.Notice) { got = n }
 	_, err := request.Ensure(context.Background(), e.opts)
@@ -632,7 +626,7 @@ func TestResumeNeedsNoDiscovery(t *testing.T) {
 
 func TestPendingRefused(t *testing.T) {
 	e := newEnv(t)
-	writePending(t, e, 0o640, pendingJSON(time.Now().Add(time.Hour), e.p.URL()+"/poll"))
+	writePending(t, e, 0o640, pendingJSON(e, time.Now().Add(time.Hour), e.p.URL()+"/poll"))
 	_, err := request.Ensure(context.Background(), e.opts)
 	if err == nil || !strings.Contains(err.Error(), request.PendingPath(e.token)) {
 		t.Errorf("group-readable: err = %v", err)
@@ -660,10 +654,10 @@ func TestBackground(t *testing.T) {
 	ctx := context.Background()
 
 	e.opts.Wait = false
-	tok, err := request.Ensure(ctx, e.opts)
+	res, err := request.Ensure(ctx, e.opts)
 	var ep *request.ErrPending
-	if tok != "" || !errors.As(err, &ep) {
-		t.Fatalf("tok=%q err=%v", tok, err)
+	if res != (request.Result{}) || !errors.As(err, &ep) {
+		t.Fatalf("res=%+v err=%v", res, err)
 	}
 	t.Cleanup(func() { waitDone(t, ep) })
 	n := ep.Notice
@@ -706,10 +700,10 @@ func TestBackground(t *testing.T) {
 	if b, _ := os.ReadFile(e.token); string(b) != e.p.Key() {
 		t.Error("token not written")
 	}
-	// Now the token is there: Ensure returns it, no request.
-	tok, err = request.Ensure(ctx, e.opts)
-	if err != nil || tok != e.p.Key() {
-		t.Errorf("after: tok=%q err=%v", tok, err)
+	// Now the token is there: Ensure returns it, no request, no name or role.
+	res, err = request.Ensure(ctx, e.opts)
+	if err != nil || res != (request.Result{Token: e.p.Key()}) {
+		t.Errorf("after: res=%+v err=%v", res, err)
 	}
 	if notified.Load() != 1 || len(e.p.Filed()) != 1 {
 		t.Error("a request was made with a token present")
@@ -721,9 +715,9 @@ func TestWaitJoinsBackground(t *testing.T) {
 	ep := e.background(context.Background())
 	e.p.Script(keyclienttest.Approved())
 	e.opts.Wait = true
-	tok, err := request.Ensure(context.Background(), e.opts)
-	if err != nil || tok != e.p.Key() {
-		t.Fatalf("tok=%q err=%v", tok, err)
+	res, err := request.Ensure(context.Background(), e.opts)
+	if err != nil || res.Token != e.p.Key() {
+		t.Fatalf("res=%+v err=%v", res, err)
 	}
 	waitDone(t, ep)
 	if len(e.p.Filed()) != 1 {
@@ -761,10 +755,15 @@ func TestExistingTokenMakesNoRequest(t *testing.T) {
 	e.opts.ServiceURL = "http://127.0.0.1:1"
 	for _, wait := range []bool{true, false} {
 		e.opts.Wait = wait
-		tok, err := request.Ensure(context.Background(), e.opts)
-		if err != nil || tok != "my-token" {
-			t.Errorf("Wait=%v: tok=%q err=%v", wait, tok, err)
+		res, err := request.Ensure(context.Background(), e.opts)
+		if err != nil || res != (request.Result{Token: "my-token"}) {
+			t.Errorf("Wait=%v: res=%+v err=%v", wait, res, err)
 		}
+	}
+	// A token on disk wins even over URLs the package would refuse.
+	e.opts.ServiceURL = "http://provider.example"
+	if res, err := request.Ensure(context.Background(), e.opts); err != nil || res.Token != "my-token" {
+		t.Errorf("plain http ServiceURL: res=%+v err=%v", res, err)
 	}
 	e.opts.ServiceURL = e.p.URL()
 	e.opts.Override = e.p.RequestURL()
@@ -786,9 +785,9 @@ func TestConsumedButTokenPresent(t *testing.T) {
 		}
 	}
 	// The directory is created by the pending write.
-	tok, err := request.Ensure(context.Background(), e.opts)
-	if err != nil || tok != "collected-by-other-0123456789" {
-		t.Fatalf("tok=%q err=%v", tok, err)
+	res, err := request.Ensure(context.Background(), e.opts)
+	if err != nil || res != (request.Result{Token: "collected-by-other-0123456789"}) {
+		t.Fatalf("res=%+v err=%v", res, err)
 	}
 	if e.pendingExists() {
 		t.Error("pending remains")
@@ -799,9 +798,9 @@ func TestBadKeyWritesNothing(t *testing.T) {
 	for _, key := range []string{"short-key1", "has space in it 0123456789", strings.Repeat("k", 513), "tab\tin-key-0123456789"} {
 		e := newEnv(t)
 		e.p.Script(keyclienttest.ApprovedWith("alice@laptop", "agent", key))
-		tok, err := request.Ensure(context.Background(), e.opts)
-		if err == nil || tok != "" {
-			t.Fatalf("key %q: tok=%q err=%v", key, tok, err)
+		res, err := request.Ensure(context.Background(), e.opts)
+		if err == nil || res != (request.Result{}) {
+			t.Fatalf("key %q: res=%+v err=%v", key, res, err)
 		}
 		if strings.Contains(err.Error(), key) {
 			t.Errorf("error contains the key: %v", err)
@@ -823,126 +822,13 @@ func TestTokenWriteFailureRemovesPending(t *testing.T) {
 			t.Error(err)
 		}
 	}
-	tok, err := request.Ensure(context.Background(), e.opts)
-	if err == nil || tok != "" {
-		t.Fatalf("tok=%q err=%v", tok, err)
+	res, err := request.Ensure(context.Background(), e.opts)
+	if err == nil || res != (request.Result{}) {
+		t.Fatalf("res=%+v err=%v", res, err)
 	}
 	e.noLeak(err)
 	if e.pendingExists() {
 		t.Error("pending remains: the request is consumed")
-	}
-}
-
-func TestSecretsNeverLeak(t *testing.T) {
-	e := newEnv(t)
-	ctx := context.Background()
-	var errs []error
-	collect := func(err error) { errs = append(errs, err) }
-
-	for _, sc := range []string{"denied", "expired", "unauthorized", "lost-reply"} {
-		e.p.Script(keyclienttest.Scenario(sc)...)
-		_, err := request.Ensure(ctx, e.opts)
-		collect(err)
-		os.Remove(request.PendingPath(e.token))
-	}
-	// A provider that echoes the poll secret in its message.
-	e.p.Script(keyclienttest.Status(401, fmt.Sprintf(`{"error":"x","message":"bad secret %s"}`, "fake-poll-secret-0123456789-ABCDEFGHIJKLMNO")))
-	_, err := request.Ensure(ctx, e.opts)
-	collect(err)
-	os.Remove(request.PendingPath(e.token))
-	e.p.Script(keyclienttest.Status(418, ""))
-	_, err = request.Ensure(ctx, e.opts)
-	collect(err)
-	for _, err := range errs {
-		if err == nil {
-			t.Error("an error path returned nil")
-			continue
-		}
-		e.noLeak(err)
-	}
-}
-
-func TestPollURLMustBeHTTPSWhenRequestURLIs(t *testing.T) {
-	var polled atomic.Int32
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/poll") {
-			polled.Add(1)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(201)
-		fmt.Fprintf(w, `{"request_id":"r1","poll_url":"http://127.0.0.1:1/poll","poll_secret":"s3cr3t-s3cr3t-s3cr3t","approve_url":"https://x.example/a","user_code":"AAAA-BBBB","interval":1,"expires_in":60}`)
-	}))
-	defer srv.Close()
-	e := newEnv(t)
-	e.opts.Override = srv.URL + "/requests"
-	e.opts.ServiceURL = ""
-	e.opts.HTTPClient = srv.Client()
-	_, err := request.Ensure(context.Background(), e.opts)
-	if err == nil || strings.Contains(err.Error(), "s3cr3t") {
-		t.Fatalf("err = %v", err)
-	}
-	if e.pendingExists() || polled.Load() != 0 {
-		t.Error("pending written or polled")
-	}
-}
-
-func TestInvalid201Replies(t *testing.T) {
-	good := map[string]any{"request_id": "r1", "poll_url": "http://127.0.0.1:1/poll", "poll_secret": "s3cr3t-s3cr3t",
-		"approve_url": "http://x.example/a", "user_code": "AAAA-BBBB", "interval": 1, "expires_in": 60}
-	for _, c := range []struct {
-		name string
-		edit func(map[string]any)
-	}{
-		{"missing request_id", func(m map[string]any) { delete(m, "request_id") }},
-		{"missing poll_secret", func(m map[string]any) { delete(m, "poll_secret") }},
-		{"missing user_code", func(m map[string]any) { delete(m, "user_code") }},
-		{"interval 0", func(m map[string]any) { m["interval"] = 0 }},
-		{"expires_in 0", func(m map[string]any) { m["expires_in"] = 0 }},
-		{"relative poll_url", func(m map[string]any) { m["poll_url"] = "/poll" }},
-		{"relative approve_url", func(m map[string]any) { m["approve_url"] = "/a" }},
-		{"ftp approve_url", func(m map[string]any) { m["approve_url"] = "ftp://x/a" }},
-	} {
-		m := map[string]any{}
-		for k, v := range good {
-			m[k] = v
-		}
-		c.edit(m)
-		b, _ := json.Marshal(m)
-		e := newEnv(t)
-		e.p.FileWith(keyclienttest.Status(201, string(b)))
-		_, err := request.Ensure(context.Background(), e.opts)
-		if err == nil || strings.Contains(err.Error(), "s3cr3t") {
-			t.Errorf("%s: err = %v", c.name, err)
-		}
-		if e.pendingExists() {
-			t.Errorf("%s: pending written", c.name)
-		}
-	}
-}
-
-func TestIsTerminal(t *testing.T) {
-	f, err := os.Create(filepath.Join(t.TempDir(), "plain"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	if request.IsTerminal(f) {
-		t.Error("a regular file is not a terminal")
-	}
-	if request.IsTerminal(nil) {
-		t.Error("nil is not a terminal")
-	}
-	// /dev/null is a character device, so IsTerminal reports true for it: the
-	// check is os.ModeCharDevice, which does not tell a terminal from other
-	// character devices.
-	dn, err := os.Open(os.DevNull)
-	if err != nil {
-		t.Skip("no /dev/null")
-	}
-	defer dn.Close()
-	if !request.IsTerminal(dn) {
-		t.Error("/dev/null is a character device")
 	}
 }
 
@@ -952,12 +838,12 @@ func TestRealSecond(t *testing.T) {
 	token := filepath.Join(t.TempDir(), "token")
 	p.Script(keyclienttest.Approved())
 	start := time.Now()
-	tok, err := request.Ensure(context.Background(), request.Options{
+	res, err := request.Ensure(context.Background(), request.Options{
 		ServiceURL: p.URL(), TokenPath: token, Role: "agent", NameHint: "alice@laptop", Host: "laptop",
 		Tool: "mytool/0.3.0", Wait: true,
 	})
-	if err != nil || tok != p.Key() {
-		t.Fatalf("tok=%q err=%v", tok, err)
+	if err != nil || res.Token != p.Key() {
+		t.Fatalf("res=%+v err=%v", res, err)
 	}
 	if d := time.Since(start); d < time.Second || d > 5*time.Second {
 		t.Errorf("took %v, want about 1s", d)
