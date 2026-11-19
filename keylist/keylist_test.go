@@ -55,6 +55,9 @@ type env struct {
 	log       *syncBuf
 	dir       string
 	forbidden []string
+	// skipInvariants turns off the end-of-test checks of K-I1 and R-I2 for a
+	// test that tampers with the cache file itself.
+	skipInvariants bool
 }
 
 func newEnv(t *testing.T) *env {
@@ -97,6 +100,22 @@ func (e *env) source(o keylist.Options) *keylist.Source {
 	s, err := keylist.New(o)
 	if err != nil {
 		e.t.Fatal(err)
+	}
+	if !e.skipInvariants {
+		// Registered first, so it runs after begin's cleanup has stopped the
+		// Source and waited for its last pull.
+		e.t.Cleanup(func() {
+			if err := keylist.CheckKI1(s); err != nil {
+				e.t.Error(err)
+			}
+			for i := 0; keylist.Waiters(s) != 0; i++ { // R-I2
+				if i > 500 {
+					e.t.Errorf("R-I2: %d waiters left at the end of the test", keylist.Waiters(s))
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
 	}
 	return s
 }

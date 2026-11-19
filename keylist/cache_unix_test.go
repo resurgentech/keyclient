@@ -90,6 +90,7 @@ func TestStaleCacheNotLoadedOverFresherList(t *testing.T) {
 // already pulled in this process.
 func TestStartDoesNotLoadCacheOverPulledList(t *testing.T) {
 	e := newEnv(t)
+	e.skipInvariants = true // the test itself replaces the cache with a stale body
 	e.add("alice@laptop", "agent", "key-alice")
 	e.secret("key-revoked")
 	s := e.source(e.opts())

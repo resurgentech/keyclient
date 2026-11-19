@@ -49,6 +49,8 @@ func Example() {
 	}
 
 	src, err := keylist.New(keylist.Options{
+		// A plain http URL is allowed here only because the host is loopback;
+		// otherwise use https, or set AllowInsecureHTTP for a path you trust.
 		URL:           srv.URL,
 		TokenFile:     tokenFile,
 		CacheFile:     filepath.Join(dir, "cache", "personal-keys.json"),

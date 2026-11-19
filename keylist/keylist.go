@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -47,8 +48,24 @@ const (
 // ErrCacheWrite is wrapped by the error of [Source.Pull] when the list was
 // applied but could not be written to the cache file. The list is live in
 // memory regardless; the pull counts as a success for [Status.LastSuccess],
-// but the error is [Status.LastError] and [Status.CacheFailing] is set.
+// but the error is [Status.LastError] and [Status.CacheFailing] is set. The
+// version marker is then unset, so the next pull is a full 200 that writes the
+// cache again.
 var ErrCacheWrite = errors.New("key list cache not written")
+
+// Origin says where the live list of a [Source] came from.
+type Origin string
+
+// The values of [Status.Origin].
+const (
+	// OriginNone: nothing has been loaded; the list is empty.
+	OriginNone Origin = "none"
+	// OriginCache: the list is what the cache file held at [Source.Start], and
+	// no good pull has landed since.
+	OriginCache Origin = "cache"
+	// OriginProvider: the list is the latest good 200 of this process.
+	OriginProvider Origin = "provider"
+)
 
 // Status is the health of a [Source], from [Source.Status].
 //
@@ -63,13 +80,26 @@ type Status struct {
 	// LastError is nil unless the latest pull attempt failed. It wraps
 	// [ErrCacheWrite] when the list was applied but not cached.
 	LastError error
-	// Age is the time since LastSuccess; 0 when LastSuccess is zero.
+	// Age is the age of the live list: the time since ListTime. For a list from
+	// the provider that is the time since the last good pull; for a list served
+	// from the cache it is the age of the cache file, so a list from an old
+	// cache is never reported as age zero. It is 0 only when Origin is
+	// [OriginNone].
 	Age time.Duration
 	// Entries is the number of live entries.
 	Entries int
 	// CacheFailing is true when the latest cache write failed (the list is
 	// live in memory regardless). It clears at the next successful write.
 	CacheFailing bool
+	// Origin says where the live list came from: [OriginNone], [OriginCache]
+	// or [OriginProvider].
+	Origin Origin
+	// ListTime is when the live list was last known good: the time of the last
+	// good pull for [OriginProvider] (the same as LastSuccess), the
+	// modification time of the cache file for [OriginCache], zero for
+	// [OriginNone]. LastSuccess keeps its meaning, the last good pull: it is
+	// zero while the list comes from the cache.
+	ListTime time.Time
 }
 
 // Entry is one entry of the key list.
@@ -101,10 +131,23 @@ type Options struct {
 	// service cannot forget the contract's unknown-role and local-tokens-win
 	// rules. [AcceptRoles] implements them. A service that really accepts every
 	// entry says so with a function that returns true.
+	//
+	// Accept must give the same answer for the same entry for the life of the
+	// Source: it must not look at anything that changes (the daemon's tokens, the
+	// roles it knows). It is called again for the same entry at every good pull,
+	// and a 304 keeps the list as it was filtered. A service whose tokens or
+	// roles change restarts its Source, which filters the list again because the
+	// version marker starts unset. See also [AcceptRoles].
 	Accept func(Entry) (ok bool, reason string)
 	// HTTPClient is used for pulls. A shallow copy is made that never follows
 	// redirects. Nil means a new client.
 	HTTPClient *http.Client
+	// AllowInsecureHTTP allows a plain http URL to any host. By default plain
+	// http is refused by New unless the host is a loopback address: "localhost"
+	// (by name), 127.0.0.0/8 or ::1. The pull token travels in the clear over
+	// plain http, and the list decides who is let in: set this only for a
+	// network path you trust.
+	AllowInsecureHTTP bool
 	// Logger receives the log lines; nil means slog.Default().
 	Logger *slog.Logger
 }
@@ -130,6 +173,11 @@ type flight struct{ done chan struct{} }
 // reasons it gives are "unknown role" and "name or key already in the local
 // token source". takenLocally gets the whole Entry, so it can check the name
 // and the SHA-256; nil means nothing is taken locally.
+//
+// The function it returns gives the same answer for the same entry for the life
+// of the Source, as [Options.Accept] requires, provided roles and takenLocally
+// do not change: takenLocally must be a fixed check. A daemon whose tokens
+// change restarts its Source.
 func AcceptRoles(roles []string, takenLocally func(Entry) bool) func(Entry) (ok bool, reason string) {
 	known := append([]string(nil), roles...)
 	return func(e Entry) (bool, string) {
@@ -172,10 +220,12 @@ type Source struct {
 	lastErr string     // text of the last logged failure
 	applied bool       // a 200 has been applied in this process
 
-	statusMu     sync.Mutex // guards the next three
+	statusMu     sync.Mutex // guards the next five
 	lastSuccess  time.Time
 	lastPullErr  error
 	cacheFailing bool
+	origin       Origin    // where the live list came from
+	cacheTime    time.Time // modification time of the cache file the list came from
 
 	mu           sync.Mutex // guards the next eight
 	started      bool
@@ -188,6 +238,7 @@ type Source struct {
 	trailGen     int             // identifies the current trailing timer
 
 	timerPulls atomic.Int64 // pulls started by Start's timer (tests)
+	swapHook   func()       // called just before the list is swapped (tests)
 }
 
 // New checks the options, reads the token file when set, and returns a Source
@@ -197,6 +248,10 @@ func New(o Options) (*Source, error) {
 	if o.URL == "" || err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		// The URL is not echoed: it may hold userinfo.
 		return nil, errors.New("keylist: Options.URL must be an absolute http or https URL")
+	}
+	if u.Scheme == "http" && !o.AllowInsecureHTTP && !isLoopback(u.Hostname()) {
+		// The URL is not echoed: it may hold userinfo.
+		return nil, errors.New("keylist: Options.URL uses plain http to a host that is not a loopback address; use https, or set AllowInsecureHTTP for a network path you trust")
 	}
 	if o.CacheFile == "" {
 		return nil, errors.New("keylist: Options.CacheFile is required")
@@ -232,7 +287,17 @@ func New(o Options) (*Source, error) {
 	s.client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	empty := []held{}
 	s.list.Store(&empty)
+	s.origin = OriginNone
 	return s, nil
+}
+
+// isLoopback reports whether host is "localhost" or a loopback IP address.
+func isLoopback(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	a, err := netip.ParseAddr(host)
+	return err == nil && a.Unmap().IsLoopback()
 }
 
 // readToken reads the pull token file. Errors name the file, never its content.
@@ -250,7 +315,12 @@ func (s *Source) readToken() (string, error) {
 
 // Start loads CacheFile (synchronously), then in a goroutine pulls at once and
 // every Refresh until ctx ends. It returns an error only if called twice. The
-// service starts even when the provider is down.
+// service starts even when the provider is down. Start first removes the
+// temporary files that an interrupted cache write left beside CacheFile, and
+// ignores a cache that is not a regular file, that group or others can write,
+// or that another user owns. When ctx ends no pull starts again (timer, miss or
+// trailing) and a pull in flight is cut short without being counted as a
+// failure; the list stays live.
 func (s *Source) Start(ctx context.Context) error {
 	s.mu.Lock()
 	if s.started {
@@ -265,6 +335,10 @@ func (s *Source) Start(ctx context.Context) error {
 	// by the older cache. A list already pulled in this process is newer than
 	// any cache, so the cache is then not loaded at all.
 	s.pullMu.Lock()
+	// A write cut short by a kill leaves a temporary file beside the cache (K-13).
+	if err := atomicfile.RemoveTemps(s.o.CacheFile); err != nil {
+		s.log.Warn("key list cache: temporary files cannot be removed", "error", err.Error())
+	}
 	if !s.applied {
 		s.loadCache()
 	}
@@ -296,8 +370,17 @@ func (s *Source) timerPull(ctx context.Context) {
 		return
 	}
 	s.timerPulls.Add(1)
-	_ = s.Pull(ctx) // a failure is logged by Pull
+	_ = s.pullScheduled(ctx) // a failure is logged by Pull
 }
+
+// stopped reports whether the context given to Start has ended (R5).
+func (s *Source) stopped() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stoppedLocked()
+}
+
+func (s *Source) stoppedLocked() bool { return s.baseCtx != nil && s.baseCtx.Err() != nil }
 
 // Len is the number of live entries.
 func (s *Source) Len() int { return len(*s.list.Load()) }
@@ -330,7 +413,9 @@ func (s *Source) Lookup(presented string) (name, role string, ok bool) {
 // Options.RefreshOnMiss, after which the key is checked again. At most
 // [MaxMissWaiters] callers wait at once; a miss past that answers at once. When
 // a miss was refused a pull, one more miss-triggered pull starts when its
-// window ends. A daemon calls it only after its own tokens have missed.
+// window ends. After the context given to Start has ended it pulls nothing: a
+// miss is answered from the list at once. A daemon calls it only after its own
+// tokens have missed.
 func (s *Source) LookupOrRefresh(ctx context.Context, presented string) (name, role string, ok bool) {
 	if name, role, ok = s.Lookup(presented); ok {
 		return name, role, true
@@ -340,6 +425,12 @@ func (s *Source) LookupOrRefresh(ctx context.Context, presented string) (name, r
 	}
 
 	s.mu.Lock()
+	if s.stoppedLocked() {
+		// R-16: after Start's context has ended no pull starts. The answer
+		// comes from the list at once.
+		s.mu.Unlock()
+		return s.Lookup(presented)
+	}
 	f := s.inflight
 	if f == nil {
 		now := s.now()
@@ -417,12 +508,14 @@ func (s *Source) stopTrailingLocked() {
 // current window, unless one is already arranged or Start's ctx has ended. The
 // caller holds mu.
 func (s *Source) scheduleTrailingLocked(now time.Time) {
-	if s.trailing != nil || (s.baseCtx != nil && s.baseCtx.Err() != nil) {
+	if s.trailing != nil || s.stoppedLocked() {
 		return
 	}
 	d := s.lastMissPull.Add(s.o.RefreshOnMiss).Sub(now)
-	if d < 0 {
-		d = 0
+	if d <= 0 {
+		// R-4: the window is already over; nothing is armed. The next miss
+		// starts its own pull.
+		return
 	}
 	gen := s.trailGen
 	s.trailing = time.AfterFunc(d, func() { s.trailingPull(gen) })
@@ -438,8 +531,7 @@ func (s *Source) trailingPull(gen int) {
 	}
 	s.trailing = nil
 	now := s.now()
-	if s.inflight != nil || now.Sub(s.lastMissPull) < s.o.RefreshOnMiss ||
-		(s.baseCtx != nil && s.baseCtx.Err() != nil) {
+	if s.inflight != nil || now.Sub(s.lastMissPull) < s.o.RefreshOnMiss || s.stoppedLocked() {
 		s.mu.Unlock()
 		return
 	}
@@ -455,20 +547,26 @@ func (s *Source) missPull(ctx context.Context, f *flight) {
 		close(f.done)
 		s.mu.Unlock()
 	}()
-	_ = s.Pull(ctx) // a failure is logged by Pull
+	_ = s.pullScheduled(ctx) // a failure is logged by Pull
 }
 
 // Status reports the health of the Source: when the last good pull was, whether
-// the latest attempt failed, how old the list is, how many entries are live,
-// and whether the cache is failing. A daemon can expose it on a health
-// endpoint. There is no staleness cut-off: the last good list is served for as
-// long as the provider is down.
+// the latest attempt failed, where the live list came from and how old it is,
+// how many entries are live, and whether the cache is failing. A daemon can
+// expose it on a health endpoint. There is no staleness cut-off: the last good
+// list is served for as long as the provider is down.
 func (s *Source) Status() Status {
 	s.statusMu.Lock()
-	st := Status{LastSuccess: s.lastSuccess, LastError: s.lastPullErr, CacheFailing: s.cacheFailing}
+	st := Status{LastSuccess: s.lastSuccess, LastError: s.lastPullErr, CacheFailing: s.cacheFailing, Origin: s.origin}
+	switch s.origin {
+	case OriginProvider:
+		st.ListTime = s.lastSuccess
+	case OriginCache:
+		st.ListTime = s.cacheTime
+	}
 	s.statusMu.Unlock()
-	if !st.LastSuccess.IsZero() {
-		st.Age = s.now().Sub(st.LastSuccess)
+	if !st.ListTime.IsZero() {
+		st.Age = s.now().Sub(st.ListTime)
 	}
 	st.Entries = s.Len()
 	return st
@@ -479,14 +577,43 @@ func (s *Source) Status() Status {
 // userinfo. When the list was applied but could not be cached, the error wraps
 // [ErrCacheWrite]: the list is live in memory regardless. Pulls (timer, miss,
 // Pull) are serialised.
+//
+// Pull is the caller's own pull: it is made even after the context given to
+// [Source.Start] has ended. If that context has ended and ctx's error cuts the
+// pull short, the error is returned but is neither logged as a failure nor
+// kept in [Status.LastError].
 func (s *Source) Pull(ctx context.Context) error {
 	s.pullMu.Lock()
 	defer s.pullMu.Unlock()
+	return s.pullLocked(ctx)
+}
+
+// pullScheduled is a pull of the timer, a miss or a trailing pull. It is not
+// made when ctx, the context given to Start, has ended by the time its turn
+// comes (R-I6).
+func (s *Source) pullScheduled(ctx context.Context) error {
+	s.pullMu.Lock()
+	defer s.pullMu.Unlock()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return s.pullLocked(ctx)
+}
+
+// pullLocked makes one pull and records its outcome. The caller holds pullMu.
+func (s *Source) pullLocked(ctx context.Context) error {
 	err := s.pull(ctx)
+	if err != nil && s.stopped() && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		// K-12: shutdown cut this pull short; it is not a failure of the provider.
+		return err
+	}
 	s.note(err)
 	s.statusMu.Lock()
 	if err == nil || errors.Is(err, ErrCacheWrite) {
 		s.lastSuccess = s.now()
+	}
+	if s.applied {
+		s.origin = OriginProvider
 	}
 	s.lastPullErr = err
 	s.statusMu.Unlock()
@@ -579,17 +706,26 @@ func (s *Source) pull(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("keylist: pull: %w", err)
 	}
-	s.apply(entries)
-	s.applied = true
-	s.etag = resp.Header.Get("ETag")
-	if err := atomicfile.Write(s.o.CacheFile, body); err != nil {
+	live := s.build(entries, true)
+	// K-5: the cache first, then the swap, so that a crash between the two never
+	// leaves the cache older than a list that was live.
+	werr := atomicfile.Write(s.o.CacheFile, body)
+	if werr != nil {
 		// The cache must never hold a list older than the one now live: take
 		// the old one away, or if that fails empty it.
 		s.dropCache()
-		s.log.Error("key list cache not written, the list is applied anyway", "error", err.Error())
-		s.setCacheFailing(true)
-		return fmt.Errorf("keylist: pull: %w: %w", ErrCacheWrite, err)
+		s.log.Error("key list cache not written, the list is applied anyway", "error", werr.Error())
 	}
+	s.swap(live)
+	s.applied = true
+	if werr != nil {
+		// K-6: no marker, so the next pull is a full 200 and writes the cache
+		// again (K-I1: a marker is set only while the cache holds this body).
+		s.etag = ""
+		s.setCacheFailing(true)
+		return fmt.Errorf("keylist: pull: %w: %w", ErrCacheWrite, werr)
+	}
+	s.etag = resp.Header.Get("ETag")
 	s.setCacheFailing(false)
 	return nil
 }
@@ -607,7 +743,8 @@ func (s *Source) dropCache() {
 	if err == nil || errors.Is(err, os.ErrNotExist) {
 		return
 	}
-	if err := os.Truncate(s.o.CacheFile, 0); err != nil && !errors.Is(err, os.ErrNotExist) {
+	// Never through a symlink, and only a regular file (K-6, K-7).
+	if err := emptyFile(s.o.CacheFile); err != nil && !errors.Is(err, os.ErrNotExist) {
 		s.log.Error("key list stale cache cannot be removed or emptied, a restart may load an older list", "error", err.Error())
 	}
 }
@@ -747,21 +884,40 @@ func parseEntries(dec *json.Decoder) ([]Entry, error) {
 // apply skips repeats and refused entries (logging name and reason, never a
 // hash) and swaps the rest in at once.
 func (s *Source) apply(entries []Entry) {
+	s.swap(s.build(entries, true))
+}
+
+// swap makes live the list that lookups see, as one whole.
+func (s *Source) swap(live []held) {
+	if s.swapHook != nil {
+		s.swapHook()
+	}
+	s.list.Store(&live)
+}
+
+// build is the list that entries make: the repeats and the refused entries
+// left out, each of them logged (name and reason, never a hash) when logSkips.
+func (s *Source) build(entries []Entry, logSkips bool) []held {
+	skip := func(name, reason string) {
+		if logSkips {
+			s.log.Warn("key list entry skipped", "name", name, "reason", reason)
+		}
+	}
 	names := make(map[string]bool, len(entries))
 	sums := make(map[string]bool, len(entries))
 	live := make([]held, 0, len(entries))
 	for _, e := range entries {
 		if names[e.Name] {
-			s.log.Warn("key list entry skipped", "name", e.Name, "reason", "name repeated in the list")
+			skip(e.Name, "name repeated in the list")
 			continue
 		}
 		if sums[e.SHA256] {
-			s.log.Warn("key list entry skipped", "name", e.Name, "reason", "key repeated in the list")
+			skip(e.Name, "key repeated in the list")
 			continue
 		}
 		names[e.Name], sums[e.SHA256] = true, true
 		if ok, reason := s.o.Accept(e); !ok {
-			s.log.Warn("key list entry skipped", "name", e.Name, "reason", reason)
+			skip(e.Name, reason)
 			continue
 		}
 		h := held{name: e.Name, role: e.Role}
@@ -770,7 +926,7 @@ func (s *Source) apply(entries []Entry) {
 		}
 		live = append(live, h)
 	}
-	s.list.Store(&live)
+	return live
 }
 
 // loadCache applies CacheFile through the same checks as a pulled list. The
@@ -800,6 +956,10 @@ func (s *Source) loadCache() {
 		s.log.Warn("key list cache ignored, group or others can write it", "mode", st.Mode().Perm().String())
 		return
 	}
+	if cacheForeignOwner(st) {
+		s.log.Warn("key list cache ignored, not owned by the current user")
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(f, MaxBody+1))
 	if err != nil || len(body) > MaxBody {
 		s.log.Warn("key list cache ignored, cannot be read or is too large")
@@ -811,5 +971,8 @@ func (s *Source) loadCache() {
 		return
 	}
 	s.apply(entries)
+	s.statusMu.Lock()
+	s.origin, s.cacheTime = OriginCache, st.ModTime()
+	s.statusMu.Unlock()
 	s.log.Info("key list cache loaded", "entries", s.Len())
 }
