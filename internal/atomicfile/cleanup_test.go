@@ -40,6 +40,34 @@ func TestRemoveTempsRemovesOnlyThisPathsTemps(t *testing.T) {
 			t.Errorf("%s exists = %v, want %v", filepath.Base(p), got, want)
 		}
 	}
+	// The names Write really makes are removed; the temporary files of a token
+	// whose name merely starts like this one's are not (T-25, K-13).
+	if err := Write(path, []byte("y")); err != nil {
+		t.Fatal(err)
+	}
+	neighbour := filepath.Join(dir, "token.tmp-x")
+	if err := Write(neighbour, []byte("z")); err != nil {
+		t.Fatal(err)
+	}
+	created, err := os.CreateTemp(dir, ".token.tmp-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created.Close()
+	ncreated, err := os.CreateTemp(dir, ".token.tmp-x.tmp-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ncreated.Close()
+	if err := RemoveTemps(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(created.Name()); err == nil {
+		t.Errorf("%s (a temporary file of token) remains", filepath.Base(created.Name()))
+	}
+	if _, err := os.Lstat(ncreated.Name()); err != nil {
+		t.Errorf("%s (a temporary file of token.tmp-x) was removed", filepath.Base(ncreated.Name()))
+	}
 	// A missing directory is not an error.
 	if err := RemoveTemps(filepath.Join(dir, "missing", "token")); err != nil {
 		t.Errorf("missing directory: %v", err)
