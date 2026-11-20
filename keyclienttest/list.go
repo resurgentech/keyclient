@@ -59,7 +59,9 @@ func NewList(t testing.TB) *List {
 	l := &List{t: t}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/lists/example", l.handle)
-	l.srv = httptest.NewServer(mux)
+	// Set before the server starts, as in NewProvider.
+	l.srv = httptest.NewUnstartedServer(mux)
+	l.srv.Start()
 	// Cleanups run last in, first out: a Block is released before the server
 	// closes, which would otherwise wait for the held pulls.
 	t.Cleanup(l.srv.Close)

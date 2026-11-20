@@ -109,7 +109,10 @@ func NewProvider(t testing.TB) *Provider {
 	mux.HandleFunc("GET /v1/key-request", p.handleDiscovery)
 	mux.HandleFunc("POST /v1/services/example/requests", p.handleFile)
 	mux.HandleFunc("POST /v1/requests/{id}/poll", p.handlePoll)
-	p.srv = httptest.NewServer(mux)
+	// The field is set before the server starts, so a handler (serving a
+	// request from another goroutine or process) never races with it.
+	p.srv = httptest.NewUnstartedServer(mux)
+	p.srv.Start()
 	t.Cleanup(p.srv.Close)
 	return p
 }
