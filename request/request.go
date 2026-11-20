@@ -651,22 +651,22 @@ func readPending(path string) (b []byte, exists bool, err error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, false, nil
 		}
-		return nil, true, fmt.Errorf("key request: cannot open the pending file %s: %w", path, err)
+		return nil, true, unusable(fmt.Errorf("key request: cannot open the pending file %s: %w; remove it", path, err))
 	}
 	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {
-		return nil, true, fmt.Errorf("key request: cannot stat the pending file %s: %w", path, err)
+		return nil, true, unusable(fmt.Errorf("key request: cannot stat the pending file %s: %w; remove it", path, err))
 	}
 	if !fi.Mode().IsRegular() || fi.Mode().Perm()&0o077 != 0 {
-		return nil, true, fmt.Errorf("key request: the pending file %s must be a regular file readable only by its owner (mode 0600); fix its mode or remove it", path)
+		return nil, true, unusable(fmt.Errorf("key request: the pending file %s must be a regular file readable only by its owner (mode 0600); fix its mode or remove it", path))
 	}
 	if !ownedByMe(fi) {
-		return nil, true, fmt.Errorf("key request: the pending file %s is not owned by this user; remove it", path)
+		return nil, true, unusable(fmt.Errorf("key request: the pending file %s is not owned by this user; remove it", path))
 	}
 	b, over, err := readReply(f)
 	if err != nil || over {
-		return nil, true, fmt.Errorf("key request: the pending file %s cannot be used; remove it (unreadable, or larger than 64 KiB)", path)
+		return nil, true, unusable(fmt.Errorf("key request: the pending file %s cannot be used; remove it (unreadable, or larger than 64 KiB)", path))
 	}
 	return b, true, nil
 }
@@ -676,7 +676,8 @@ func readPending(path string) (b []byte, exists bool, err error) {
 const (
 	pendingAbsent  = iota
 	pendingCurrent // filed for this run's service URL and override, not expired
-	pendingStale   // foreign (another service URL or override) or expired
+	pendingForeign // filed for another service URL or override
+	pendingExpired // its time has run out
 )
 
 // parsePending reads the pending file and tells its state. It changes nothing.
@@ -688,13 +689,16 @@ func parsePending(path, serviceURL, override string, pol policy, unit time.Durat
 		return pf, pendingAbsent, err
 	}
 	bad := func(why string) error {
-		return fmt.Errorf("key request: the pending file %s cannot be used; remove it (%s)", path, why)
+		return unusable(fmt.Errorf("key request: the pending file %s cannot be used; remove it (%s)", path, why))
 	}
 	if json.Unmarshal(b, &pf) != nil {
 		return pendingFile{}, pendingAbsent, bad("not valid JSON of the expected shape")
 	}
-	if pf.ServiceURL != serviceURL || pf.Override != override || !now().Before(pf.ExpiresAt) {
-		return pendingFile{}, pendingStale, nil
+	if pf.ServiceURL != serviceURL || pf.Override != override {
+		return pendingFile{}, pendingForeign, nil
+	}
+	if !now().Before(pf.ExpiresAt) {
+		return pendingFile{}, pendingExpired, nil
 	}
 	if !reRole.MatchString(pf.Role) || !reTool.MatchString(pf.Tool) || pf.Interval < 1 {
 		return pendingFile{}, pendingAbsent, bad("role, tool or interval breaks its rule")
@@ -717,7 +721,7 @@ func parsePending(path, serviceURL, override string, pol policy, unit time.Durat
 // there is none, or when it is foreign or expired: then it is removed (T-12).
 func loadPending(path, serviceURL, override string, pol policy, unit time.Duration) (pf pendingFile, resumed bool, err error) {
 	pf, state, err := parsePending(path, serviceURL, override, pol, unit)
-	if state == pendingStale {
+	if state == pendingForeign || state == pendingExpired {
 		os.Remove(path)
 	}
 	return pf, state == pendingCurrent, err
