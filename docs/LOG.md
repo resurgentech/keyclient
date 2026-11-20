@@ -78,3 +78,16 @@ What changes for a user of the module (no exported API changed):
 - A failing cache write is logged once per streak, and the recovery once.
 - Clean-up of interrupted writes removes exactly the temporary names `Write` makes for that path.
 - Commits: the v0.1.1 commits on top of 9ce1f10; tag `v0.1.1`.
+
+## 2026-11-19 — v0.1.2
+
+What changes for a user of the module:
+
+- New `request.Pending(o Options) (Notice, bool, error)`: a read-only view of the open request recorded beside the
+  token file (no lock, no network, no change), with the same checks as resuming; new sentinels
+  `ErrPendingExpired`, `ErrPendingForeign` and `ErrPendingUnusable`. The errors `Ensure` gives for an unusable
+  pending file now also match `ErrPendingUnusable` (wording unchanged, except that an unopenable file now also says
+  "remove it"). STATES.md row T-30.
+- `keyclienttest.NewProvider` and `NewList` no longer race with a request from another goroutine or process sent
+  right after they return.
+- Commits: the v0.1.2 commits on top of 747d302; tag `v0.1.2`.

@@ -167,12 +167,13 @@ it.
 | T-27 | T1 with P present | `Ensure` | T1 | As T-1. P is a leftover of a crash between storing the key and removing P; the next lock holder removes it. |
 | T-28 | T absent | the lock path is a link, not a regular file, not owned by the effective user, writable by group or others, cannot be opened, or the file system has no locks | same | Error that names the lock file. Nothing filed: a file system without locks fails closed. |
 | T-29 | T2, T3 | `Ensure` in the same process through another name for the same token file | T5 for it | A second flow entry, which waits on the lock like another process. |
+| T-30 | any | `Pending` (a status read, for example a tool's `key status` command) | same | Reads P without the lock and changes nothing, with every check of T-11 and T-13: no P gives nothing; P current gives its notice, marked resumed; P expired, foreign or unusable gives an error that tells which (`ErrPendingExpired`, `ErrPendingForeign`, `ErrPendingUnusable`, the last naming the file). It does not look at T, takes no lock, sends nothing, and never returns the poll secret. A holder of the lock does not block it. |
 
 Invariants:
 
 - **T-I1** Whoever polls a request holds the lock, from before it reads P until its poll loop has ended. So at
   most one process, and one goroutine in it, polls a given request or files for a given token.
-- **T-I2** P is created, replaced and removed, and T is written, only by the lock holder. (T-1 reads T without it; T-4's existence check of P before an early discovery, and T-21 and T-22, read P without it, and only read.)
+- **T-I2** P is created, replaced and removed, and T is written, only by the lock holder. (T-1 reads T without it; T-4's existence check of P before an early discovery, T-21, T-22 and T-30 read P without it, and only read.)
 - **T-I3** A request is filed only when, under the lock, T is absent and P is absent.
 - **T-I4** T is written only from an approved reply to the request in P, only while T is absent, atomically, with
   mode 0600.

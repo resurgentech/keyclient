@@ -63,6 +63,12 @@ default:                                    // denied, expired, refused URL, pro
 - A tool that already has a token never makes a request. The service's refresh on miss makes a freshly delivered
   key work on the first call in the usual case; if the service refuses a key that was just delivered, wait the
   service's `refresh_on_miss` (5 s by default) and retry once.
+- **Status without side effects.** `request.Pending(opts)` reports the open request recorded beside the token file
+  for these options (service, code, approval URL, expiry, as a `Notice` marked resumed) without taking the lock,
+  polling or changing anything, for a tool's `key status` command. No pending file is `ok == false` with a nil
+  error; otherwise `errors.Is` tells `request.ErrPendingExpired`, `request.ErrPendingForeign` (filed for another
+  service URL or override) and `request.ErrPendingUnusable` (the error names the file: remove it). It never shows
+  the poll secret and does not look at the token file.
 - **One flow per token.** `Ensure` takes an exclusive lock on `TokenPath + ".lock"` before it changes the token or
   the pending file, and holds it until the flow ends, also while a `Wait: false` call's poll runs in the
   background. Callers in one process share one flow. A second copy of the tool that finds the lock held: with
